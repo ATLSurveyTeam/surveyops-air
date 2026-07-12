@@ -1,3 +1,8 @@
+import {
+  loadCloudState,
+  saveCloudState,
+  saveSurveyRecord
+} from './lib/storage.js';
 const STORAGE_SUFFIX='mvp_arrivals_20260629_v035_arrival_over_goal';
 const MANAGER_PIN='2026';
 const META={"sourceFile": "Surveys 7.1.2026 v1.xlsx", "departureRecords": 292, "commercialRecords": 214, "depComCards": 292, "arrivalRecords": 334, "arrivalWindows": ["06:00 to 08:59", "09:00 to 11:59", "12:00 to 14:59", "15:00 to 17:59", "18:00 to 20:59", "21:00 to 23:59"], "generatedFrom": "Surveys 7.1.2026 v1.xlsx"};
@@ -11,20 +16,57 @@ let depCom=JSON.parse(localStorage.getItem('soa_depcom_'+STORAGE_SUFFIX)||'null'
 let arrivals=JSON.parse(localStorage.getItem('soa_arrivals_'+STORAGE_SUFFIX)||'null')||cloneData(INITIAL_ARRIVALS);
 let agents=JSON.parse(localStorage.getItem('soa_agents_'+STORAGE_SUFFIX)||'null')||DEFAULT_AGENTS.slice();
 let activity=JSON.parse(localStorage.getItem('soa_activity_'+STORAGE_SUFFIX)||'null')||[];
-let currentSurveyor='',currentSort='most',arrivalSort='most',currentRegion='All',arrivalRegion='All',lastAction=null,noticeTimer=null;
+let currentSurveyor='',currentSort='most',arrivalSort='most',currentRegion='All',arrivalRegion='All',lastAction=null,noticeTimer=null,pinnedDepComId=null;
 function todayKey(){return new Date().toISOString().slice(0,10)}
 let currentDayKey=localStorage.getItem('soa_current_day_'+STORAGE_SUFFIX)||todayKey();
 function ensureCurrentDay(){const t=todayKey(); if(currentDayKey!==t){currentDayKey=t; localStorage.setItem('soa_current_day_'+STORAGE_SUFFIX,currentDayKey);}}
 function todayActivity(){ensureCurrentDay(); return activity.filter(a=>a.dayKey===currentDayKey)}
 function $(id){return document.getElementById(id)}
-function saveAll(){localStorage.setItem('soa_depcom_'+STORAGE_SUFFIX,JSON.stringify(depCom));localStorage.setItem('soa_arrivals_'+STORAGE_SUFFIX,JSON.stringify(arrivals));localStorage.setItem('soa_agents_'+STORAGE_SUFFIX,JSON.stringify(agents));localStorage.setItem('soa_activity_'+STORAGE_SUFFIX,JSON.stringify(activity));localStorage.setItem('soa_current_day_'+STORAGE_SUFFIX,currentDayKey);}
+function saveAll(){
+  const state = { depCom, arrivals, agents, activity, currentDayKey };
+
+  localStorage.setItem('soa_depcom_'+STORAGE_SUFFIX, JSON.stringify(depCom));
+  localStorage.setItem('soa_arrivals_'+STORAGE_SUFFIX, JSON.stringify(arrivals));
+  localStorage.setItem('soa_agents_'+STORAGE_SUFFIX, JSON.stringify(agents));
+  localStorage.setItem('soa_activity_'+STORAGE_SUFFIX, JSON.stringify(activity));
+  localStorage.setItem('soa_current_day_'+STORAGE_SUFFIX, currentDayKey);
+
+  saveCloudState(state);
+}
 function show(id){['home','agentLogin','workType','depComApp','arrivalsApp','managerLogin','managerApp'].forEach(x=>$(x).classList.add('hidden'));$(id).classList.remove('hidden');if(id==='managerApp')renderManager();if(id==='depComApp')renderCards();if(id==='arrivalsApp')renderArrivalCards();}
 function escapeHtml(s){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
 function totalStillNeeded(r){return (r.departureRemaining||0)+(r.commercialRemaining||0)}
 function airlineOptions(){const m=new Map();depCom.forEach(r=>m.set(r.airline,r.airlineName||r.airline));return Array.from(m.entries()).sort((a,b)=>a[1].localeCompare(b[1]));}
 function fillSelects(){ $('surveyorSelect').innerHTML=agents.map(a=>'<option value="'+escapeHtml(a)+'">'+escapeHtml(a)+'</option>').join(''); $('airlineSelect').innerHTML=airlineOptions().map(([code,name])=>'<option value="'+escapeHtml(code)+'">'+escapeHtml(name)+'</option>').join(''); $('windowSelect').innerHTML=ARRIVAL_WINDOWS.map(w=>'<option value="'+escapeHtml(w)+'">'+escapeHtml(w)+'</option>').join('');}
 function priorityClass(n){if(n>=5)return'high';if(n>=2)return'mid';return'low'}
-function filteredRequirements(){const airline=$('airlineSelect').value;const q=$('searchBox').value.trim().toLowerCase();let arr=depCom.filter(r=>r.airline===airline);if(currentRegion!=='All')arr=arr.filter(r=>r.traffic===currentRegion);if(q)arr=arr.filter(r=>(r.search||'').includes(q));if(currentSort==='az')arr.sort((a,b)=>(a.city||a.code).localeCompare(b.city||b.code));else arr.sort((a,b)=>(totalStillNeeded(b)-totalStillNeeded(a))||((a.city||a.code).localeCompare(b.city||b.code)));return arr;}
+function filteredRequirements(){
+  const airline=$('airlineSelect').value;
+  const q=$('searchBox').value.trim().toLowerCase();
+
+  let arr=depCom.filter(r=>r.airline===airline);
+
+  if(currentRegion!=='All'){
+    arr=arr.filter(r=>r.traffic===currentRegion);
+  }
+
+  if(q){
+    arr=arr.filter(r=>(r.search||'').includes(q));
+  }
+
+  if(currentSort==='az'){
+    arr.sort((a,b)=>(a.city||a.code).localeCompare(b.city||b.code));
+  }else{
+    arr.sort((a,b)=>{
+      if(a.id===pinnedDepComId && b.id!==pinnedDepComId)return -1;
+      if(b.id===pinnedDepComId && a.id!==pinnedDepComId)return 1;
+
+      return (totalStillNeeded(b)-totalStillNeeded(a))
+        ||((a.city||a.code).localeCompare(b.city||b.code));
+    });
+  }
+
+  return arr;
+}
 function surveyBlock(r,type){const cap=type.charAt(0).toUpperCase()+type.slice(1);const rem=r[type+'Remaining']||0;const above=r[type+'AboveGoal']||0;const isComm=type==='commercial';const icon=isComm?'🛍':'✈️';const label=rem>0?'+1 '+cap:'+1 Above Goal';const cls=rem>0?(isComm?'commercial':''):'gold';let countHtml=rem>0?'<div class="count">'+icon+' '+cap+' Still Needed: <span>'+rem+'</span></div>':'<div class="count above">'+icon+' '+cap+' Minimum Achieved ✓</div><div class="muted">'+cap+' Above Goal: '+above+'</div>';return '<div class="survey-row">'+countHtml+'<button class="action-btn '+cls+'" data-id="'+r.id+'|'+type+'">'+label+'</button></div>'}
 function renderCards(){renderUserProgress();const arr=filteredRequirements();$('cards').innerHTML=arr.length?arr.map(r=>{let pills='<span class="pill '+(r.traffic==='International'?'intl':'')+'">'+escapeHtml(r.traffic||'')+'</span>';let blocks='';blocks+=surveyBlock(r,'departure');blocks+=surveyBlock(r,'commercial');if(!blocks)blocks='<div class="muted">No open requirements for this airport.</div>';return '<div class="card '+priorityClass(totalStillNeeded(r))+'"><div class="airport"><span class="airport-code">'+escapeHtml(r.code||'')+'</span>'+escapeHtml(r.city)+'</div><div class="airport-name">'+escapeHtml(r.airport||r.code)+'</div>'+pills+blocks+'</div>'}).join(''):'<div class="panel"><strong>No matching airports.</strong><div class="muted">Try another search or airline.</div></div>';document.querySelectorAll('#cards .action-btn').forEach(btn=>btn.addEventListener('click',()=>addSurvey(btn.dataset.id)))}
 function filteredArrivals(){const win=$('windowSelect').value;const q=$('arrivalSearchBox').value.trim().toLowerCase();let arr=arrivals.filter(r=>r.window===win);if(arrivalRegion!=='All')arr=arr.filter(r=>r.traffic===arrivalRegion);if(q)arr=arr.filter(r=>(r.search||'').includes(q));if(arrivalSort==='az')arr.sort((a,b)=>(a.city||a.code).localeCompare(b.city||b.code));else arr.sort((a,b)=>((b.arrivalRemaining||0)-(a.arrivalRemaining||0))||((a.city||a.code).localeCompare(b.city||b.code)));return arr;}
@@ -37,7 +79,89 @@ function arrivalBlock(r){
   return '<div class="survey-row"><div><div class="count above">🛬 Arrival Minimum Achieved ✓</div><div class="muted">Arrival Over Goal: '+above+'</div></div><button class="action-btn gold" data-id="'+r.id+'|arrival">+1 Arrival Over Goal</button></div>';
 }
 function renderArrivalCards(){renderUserProgress();const arr=filteredArrivals();$('arrivalCards').innerHTML=arr.length?arr.map(r=>{let pill='<span class="pill '+(r.traffic==='International'?'intl':'')+'">'+escapeHtml(r.traffic||'')+'</span><span class="pill">'+escapeHtml(r.window)+'</span>';return '<div class="card '+priorityClass(r.arrivalRemaining||0)+'"><div class="airport"><span class="airport-code">'+escapeHtml(r.code||'')+'</span>'+escapeHtml(r.city)+'</div><div class="airport-name">'+escapeHtml(r.airport||r.code)+'</div>'+pill+arrivalBlock(r)+'</div>'}).join(''):'<div class="panel"><strong>No matching arrivals.</strong><div class="muted">Try another search or arrival window.</div></div>';document.querySelectorAll('#arrivalCards .action-btn').forEach(btn=>btn.addEventListener('click',()=>addSurvey(btn.dataset.id)))}
-function addSurvey(id){const parts=id.split('|'); const type=parts.pop(); const baseId=parts.join('|'); let r, collection, contextLabel, remKey, aboveKey, displayType; if(type==='arrival'){collection=arrivals; r=arrivals.find(x=>x.id===baseId); remKey='arrivalRemaining'; aboveKey='arrivalAboveGoal'; displayType='Arrival'; contextLabel=r?('Window: '+r.window):'';} else {collection=depCom; r=depCom.find(x=>x.id===baseId); remKey=type+'Remaining'; aboveKey=type+'AboveGoal'; displayType=type==='departure'?'Departure':'Commercial'; contextLabel=r?(r.airlineName||r.airline):'';} if(!r)return; const wasAbove=(r[remKey]||0)<=0; if((r[remKey]||0)>0)r[remKey]-=1; else r[aboveKey]=(r[aboveKey]||0)+1; ensureCurrentDay(); const now=new Date(); const rec={dayKey:currentDayKey,time:now.toLocaleString(),surveyor:currentSurveyor,type:displayType,context:type==='arrival'?r.window:(r.airlineName||r.airline),code:r.code,city:r.city,airport:r.airport,traffic:r.traffic,aboveGoal:wasAbove}; activity.push(rec); lastAction={id:baseId,type,wasAbove}; saveAll(); if(type==='arrival')renderArrivalCards(); else renderCards(); showNotice();}
+function addSurvey(id){
+  const parts=id.split('|');
+  const type=parts.pop();
+  const baseId=parts.join('|');
+
+  let r,collection,contextLabel,remKey,aboveKey,displayType;
+
+  if(type==='arrival'){
+    collection=arrivals;
+    r=arrivals.find(x=>x.id===baseId);
+    remKey='arrivalRemaining';
+    aboveKey='arrivalAboveGoal';
+    displayType='Arrival';
+    contextLabel=r?('Window: '+r.window):'';
+  }else{
+    collection=depCom;
+    r=depCom.find(x=>x.id===baseId);
+    remKey=type+'Remaining';
+    aboveKey=type+'AboveGoal';
+    displayType=type==='departure'?'Departure':'Commercial';
+    contextLabel=r?(r.airlineName||r.airline):'';
+  }
+
+  if(!r)return;
+
+  const wasAbove=(r[remKey]||0)<=0;
+
+  if((r[remKey]||0)>0){
+    r[remKey]-=1;
+  }else{
+    r[aboveKey]=(r[aboveKey]||0)+1;
+  }
+
+  ensureCurrentDay();
+
+  const now=new Date();
+
+  const rec={
+    dayKey:currentDayKey,
+    time:now.toLocaleString(),
+    surveyor:currentSurveyor,
+    type:displayType,
+    context:type==='arrival'?r.window:(r.airlineName||r.airline),
+    code:r.code,
+    city:r.city,
+    airport:r.airport,
+    traffic:r.traffic,
+    aboveGoal:wasAbove
+  };
+
+  activity.push(rec);
+  lastAction={id:baseId,type,wasAbove};
+
+  if(type!=='arrival' && currentSort==='most'){
+    pinnedDepComId=baseId;
+  }
+
+  saveAll();
+
+  saveSurveyRecord({
+  surveyor: currentSurveyor,
+  survey_type: displayType,
+  airport_code: r.code || null,
+  airport_name: r.airport || null,
+  city: r.city || null,
+  airline: type === 'arrival'
+    ? null
+    : (r.airlineName || r.airline || null),
+  flight_number: null,
+  domestic_international: r.traffic || null
+}).catch(err => {
+  console.error('Survey record save failed:', err);
+});
+
+  if(type==='arrival'){
+    renderArrivalCards();
+  }else{
+    renderCards();
+  }
+
+  showNotice();
+}
+
 function showNotice(){clearTimeout(noticeTimer);$('notice').style.display='block';noticeTimer=setTimeout(()=>{$('notice').style.display='none';lastAction=null},5000)}
 function undoLast(){if(!lastAction)return;let r, remKey, aboveKey;if(lastAction.type==='arrival'){r=arrivals.find(x=>x.id===lastAction.id);remKey='arrivalRemaining';aboveKey='arrivalAboveGoal';}else{r=depCom.find(x=>x.id===lastAction.id);remKey=lastAction.type+'Remaining';aboveKey=lastAction.type+'AboveGoal';}if(r){if(lastAction.wasAbove&&(r[aboveKey]||0)>0)r[aboveKey]-=1;else r[remKey]=(r[remKey]||0)+1;}activity.pop();lastAction=null;$('notice').style.display='none';saveAll();renderCards();renderArrivalCards();}
 function countBy(arr,key){const out={};arr.forEach(a=>{out[a[key]]=(out[a[key]]||0)+1});return Object.entries(out).sort((a,b)=>b[1]-a[1])}
@@ -119,4 +243,28 @@ function resetSurveyDay(){
 
 function exportCsv(){const header=['SurveyDay','Time','Surveyor','SurveyType','Context','Code','City','Airport','Traffic','AboveGoal'];const rows=activity.map(a=>[a.dayKey||'Legacy',a.time,a.surveyor,a.type,a.context,a.code,a.city,a.airport,a.traffic,a.aboveGoal?'Yes':'No']);const csv=[header].concat(rows).map(row=>row.map(v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"').join(',')).join('\n');const blob=new Blob([csv],{type:'text/csv'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='surveyops_activity.csv';a.click();URL.revokeObjectURL(url)}
 function wire(){ensureCurrentDay();fillSelects();$('agentModeBtn').addEventListener('click',()=>show('agentLogin'));$('managerModeBtn').addEventListener('click',()=>show('managerLogin'));document.querySelectorAll('[data-go]').forEach(b=>b.addEventListener('click',()=>show(b.dataset.go)));$('startAgentBtn').addEventListener('click',()=>{currentSurveyor=$('surveyorSelect').value;$('workTypeWelcome').textContent='Welcome, '+currentSurveyor;show('workType')});$('openDepComBtn').addEventListener('click',()=>{$('depComWelcome').textContent='Welcome, '+currentSurveyor;show('depComApp');setTimeout(()=>$('searchBox').focus(),100)});$('openArrivalsBtn').addEventListener('click',()=>{$('arrivalsWelcome').textContent='Welcome, '+currentSurveyor;show('arrivalsApp');setTimeout(()=>$('arrivalSearchBox').focus(),100)});$('managerLoginBtn').addEventListener('click',()=>{if($('pinInput').value===MANAGER_PIN)show('managerApp');else alert('Incorrect PIN')});$('airlineSelect').addEventListener('change',renderCards);$('searchBox').addEventListener('input',renderCards);$('regionAll').addEventListener('click',()=>setRegion('depcom','All'));$('regionDomestic').addEventListener('click',()=>setRegion('depcom','Domestic'));$('regionInternational').addEventListener('click',()=>setRegion('depcom','International'));$('windowSelect').addEventListener('change',renderArrivalCards);$('arrivalSearchBox').addEventListener('input',renderArrivalCards);$('arrivalRegionAll').addEventListener('click',()=>setRegion('arrival','All'));$('arrivalRegionDomestic').addEventListener('click',()=>setRegion('arrival','Domestic'));$('arrivalRegionInternational').addEventListener('click',()=>setRegion('arrival','International'));$('sortMost').addEventListener('click',()=>{currentSort='most';$('sortMost').classList.add('active');$('sortAZ').classList.remove('active');renderCards()});$('sortAZ').addEventListener('click',()=>{currentSort='az';$('sortAZ').classList.add('active');$('sortMost').classList.remove('active');renderCards()});$('arrivalSortMost').addEventListener('click',()=>{arrivalSort='most';$('arrivalSortMost').classList.add('active');$('arrivalSortAZ').classList.remove('active');renderArrivalCards()});$('arrivalSortAZ').addEventListener('click',()=>{arrivalSort='az';$('arrivalSortAZ').classList.add('active');$('arrivalSortMost').classList.remove('active');renderArrivalCards()});$('undoBtn').addEventListener('click',undoLast);$('exportBtn').addEventListener('click',exportCsv);$('resetDayBtn').addEventListener('click',()=>{if(confirm('Reset today\'s progress counters? Workbook counts will not be restored.'))resetSurveyDay()});$('addAgentBtn').addEventListener('click',()=>{const n=$('newAgentName').value.trim();if(!n)return alert('Enter a surveyor name.');if(agents.some(a=>a.toLowerCase()===n.toLowerCase()))return alert('That surveyor already exists.');agents.push(n);$('newAgentName').value='';saveAll();fillSelects();renderAgents();renderManager()});$('newAgentName').addEventListener('keydown',e=>{if(e.key==='Enter')$('addAgentBtn').click()});$('resetActivityBtn').addEventListener('click',()=>{if(confirm('Reset demo activity and restore workbook counts?')){activity=[];depCom=cloneData(INITIAL_DEP_COM);arrivals=cloneData(INITIAL_ARRIVALS);saveAll();renderManager()}})}
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',wire);else wire();
+async function startApp(){
+  const cloudState = await loadCloudState();
+
+  if(cloudState){
+    depCom = cloudState.depCom || depCom;
+    arrivals = cloudState.arrivals || arrivals;
+    agents = cloudState.agents || agents;
+    activity = cloudState.activity || activity;
+    currentDayKey = cloudState.currentDayKey || currentDayKey;
+
+    localStorage.setItem('soa_depcom_'+STORAGE_SUFFIX, JSON.stringify(depCom));
+    localStorage.setItem('soa_arrivals_'+STORAGE_SUFFIX, JSON.stringify(arrivals));
+    localStorage.setItem('soa_agents_'+STORAGE_SUFFIX, JSON.stringify(agents));
+    localStorage.setItem('soa_activity_'+STORAGE_SUFFIX, JSON.stringify(activity));
+    localStorage.setItem('soa_current_day_'+STORAGE_SUFFIX, currentDayKey);
+  }
+
+  wire();
+}
+
+if(document.readyState==='loading'){
+  document.addEventListener('DOMContentLoaded',startApp);
+}else{
+  startApp();
+}
