@@ -3,7 +3,6 @@ import {
   saveCloudState,
   saveSurveyRecord
 } from './lib/storage.js';
-import { reviewWorkbook } from './lib/workbook.js';
 const STORAGE_SUFFIX='mvp_arrivals_20260629_v035_arrival_over_goal';
 const MANAGER_PIN='2026';
 const META={"sourceFile": "Surveys 7.1.2026 v1.xlsx", "departureRecords": 292, "commercialRecords": 214, "depComCards": 292, "arrivalRecords": 334, "arrivalWindows": ["06:00 to 08:59", "09:00 to 11:59", "12:00 to 14:59", "15:00 to 17:59", "18:00 to 20:59", "21:00 to 23:59"], "generatedFrom": "Surveys 7.1.2026 v1.xlsx"};
@@ -243,47 +242,7 @@ function resetSurveyDay(){
 }
 
 function exportCsv(){const header=['SurveyDay','Time','Surveyor','SurveyType','Context','Code','City','Airport','Traffic','AboveGoal'];const rows=activity.map(a=>[a.dayKey||'Legacy',a.time,a.surveyor,a.type,a.context,a.code,a.city,a.airport,a.traffic,a.aboveGoal?'Yes':'No']);const csv=[header].concat(rows).map(row=>row.map(v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"').join(',')).join('\n');const blob=new Blob([csv],{type:'text/csv'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='surveyops_activity.csv';a.click();URL.revokeObjectURL(url)}
-function renderWorkbookReview(result){
-  const s=result.summary;
-  $('workbookImportStatus').textContent='Workbook reviewed successfully. No survey data has been changed.';
-  $('workbookImportSummary').innerHTML=
-    '<div class="stats">'+
-      '<div class="stat"><strong>'+escapeHtml(result.fileName)+'</strong><span>Selected workbook</span></div>'+
-      '<div class="stat"><strong>'+s.departureRemainingTotal+'</strong><span>Departure surveys remaining</span></div>'+
-      '<div class="stat"><strong>'+s.commercialRemainingTotal+'</strong><span>Commercial surveys remaining</span></div>'+
-      '<div class="stat"><strong>'+s.arrivalRemainingTotal+'</strong><span>Arrival surveys remaining</span></div>'+
-    '</div>'+
-    '<div class="muted" style="margin-top:10px">'+
-      'Required airport/airline rows: '+s.departureRequired+' departures, '+
-      s.commercialRequired+' commercial, and '+s.arrivalRequired+' arrivals.<br>'+ 
-      'Zero-remaining and over-quota opportunities are retained in the reviewed data.'+
-    '</div>';
-}
-
-async function handleWorkbookReview(){
-  const file=$('workbookInput').files[0];
-  if(!file){
-    $('workbookImportStatus').textContent='Select an Excel workbook first.';
-    $('workbookImportSummary').innerHTML='';
-    return;
-  }
-
-  $('reviewWorkbookBtn').disabled=true;
-  $('workbookImportStatus').textContent='Reviewing '+file.name+'...';
-  $('workbookImportSummary').innerHTML='';
-
-  try{
-    const result=await reviewWorkbook(file,depCom,arrivals);
-    renderWorkbookReview(result);
-  }catch(error){
-    console.error('Workbook review failed:',error);
-    $('workbookImportStatus').textContent='Workbook review failed: '+(error.message||'Unknown error');
-  }finally{
-    $('reviewWorkbookBtn').disabled=false;
-  }
-}
-
-function wire(){ensureCurrentDay();fillSelects();$('workbookInput').addEventListener('change',()=>{$('workbookImportStatus').textContent=$('workbookInput').files[0]?$('workbookInput').files[0].name+' selected. Click Review Workbook.':'No workbook selected.';$('workbookImportSummary').innerHTML=''});$('reviewWorkbookBtn').addEventListener('click',handleWorkbookReview);$('agentModeBtn').addEventListener('click',()=>show('agentLogin'));$('managerModeBtn').addEventListener('click',()=>show('managerLogin'));document.querySelectorAll('[data-go]').forEach(b=>b.addEventListener('click',()=>show(b.dataset.go)));$('startAgentBtn').addEventListener('click',()=>{currentSurveyor=$('surveyorSelect').value;$('workTypeWelcome').textContent='Welcome, '+currentSurveyor;show('workType')});$('openDepComBtn').addEventListener('click',()=>{$('depComWelcome').textContent='Welcome, '+currentSurveyor;show('depComApp');setTimeout(()=>$('searchBox').focus(),100)});$('openArrivalsBtn').addEventListener('click',()=>{$('arrivalsWelcome').textContent='Welcome, '+currentSurveyor;show('arrivalsApp');setTimeout(()=>$('arrivalSearchBox').focus(),100)});$('managerLoginBtn').addEventListener('click',()=>{if($('pinInput').value===MANAGER_PIN)show('managerApp');else alert('Incorrect PIN')});$('airlineSelect').addEventListener('change',renderCards);$('searchBox').addEventListener('input',renderCards);$('regionAll').addEventListener('click',()=>setRegion('depcom','All'));$('regionDomestic').addEventListener('click',()=>setRegion('depcom','Domestic'));$('regionInternational').addEventListener('click',()=>setRegion('depcom','International'));$('windowSelect').addEventListener('change',renderArrivalCards);$('arrivalSearchBox').addEventListener('input',renderArrivalCards);$('arrivalRegionAll').addEventListener('click',()=>setRegion('arrival','All'));$('arrivalRegionDomestic').addEventListener('click',()=>setRegion('arrival','Domestic'));$('arrivalRegionInternational').addEventListener('click',()=>setRegion('arrival','International'));$('sortMost').addEventListener('click',()=>{currentSort='most';$('sortMost').classList.add('active');$('sortAZ').classList.remove('active');renderCards()});$('sortAZ').addEventListener('click',()=>{currentSort='az';$('sortAZ').classList.add('active');$('sortMost').classList.remove('active');renderCards()});$('arrivalSortMost').addEventListener('click',()=>{arrivalSort='most';$('arrivalSortMost').classList.add('active');$('arrivalSortAZ').classList.remove('active');renderArrivalCards()});$('arrivalSortAZ').addEventListener('click',()=>{arrivalSort='az';$('arrivalSortAZ').classList.add('active');$('arrivalSortMost').classList.remove('active');renderArrivalCards()});$('undoBtn').addEventListener('click',undoLast);$('exportBtn').addEventListener('click',exportCsv);$('resetDayBtn').addEventListener('click',()=>{if(confirm('Reset today\'s progress counters? Workbook counts will not be restored.'))resetSurveyDay()});$('addAgentBtn').addEventListener('click',()=>{const n=$('newAgentName').value.trim();if(!n)return alert('Enter a surveyor name.');if(agents.some(a=>a.toLowerCase()===n.toLowerCase()))return alert('That surveyor already exists.');agents.push(n);$('newAgentName').value='';saveAll();fillSelects();renderAgents();renderManager()});$('newAgentName').addEventListener('keydown',e=>{if(e.key==='Enter')$('addAgentBtn').click()});$('resetActivityBtn').addEventListener('click',()=>{if(confirm('Reset demo activity and restore workbook counts?')){activity=[];depCom=cloneData(INITIAL_DEP_COM);arrivals=cloneData(INITIAL_ARRIVALS);saveAll();renderManager()}})}
+function wire(){ensureCurrentDay();fillSelects();$('agentModeBtn').addEventListener('click',()=>show('agentLogin'));$('managerModeBtn').addEventListener('click',()=>show('managerLogin'));document.querySelectorAll('[data-go]').forEach(b=>b.addEventListener('click',()=>show(b.dataset.go)));$('startAgentBtn').addEventListener('click',()=>{currentSurveyor=$('surveyorSelect').value;$('workTypeWelcome').textContent='Welcome, '+currentSurveyor;show('workType')});$('openDepComBtn').addEventListener('click',()=>{$('depComWelcome').textContent='Welcome, '+currentSurveyor;show('depComApp');setTimeout(()=>$('searchBox').focus(),100)});$('openArrivalsBtn').addEventListener('click',()=>{$('arrivalsWelcome').textContent='Welcome, '+currentSurveyor;show('arrivalsApp');setTimeout(()=>$('arrivalSearchBox').focus(),100)});$('managerLoginBtn').addEventListener('click',()=>{if($('pinInput').value===MANAGER_PIN)show('managerApp');else alert('Incorrect PIN')});$('airlineSelect').addEventListener('change',renderCards);$('searchBox').addEventListener('input',renderCards);$('regionAll').addEventListener('click',()=>setRegion('depcom','All'));$('regionDomestic').addEventListener('click',()=>setRegion('depcom','Domestic'));$('regionInternational').addEventListener('click',()=>setRegion('depcom','International'));$('windowSelect').addEventListener('change',renderArrivalCards);$('arrivalSearchBox').addEventListener('input',renderArrivalCards);$('arrivalRegionAll').addEventListener('click',()=>setRegion('arrival','All'));$('arrivalRegionDomestic').addEventListener('click',()=>setRegion('arrival','Domestic'));$('arrivalRegionInternational').addEventListener('click',()=>setRegion('arrival','International'));$('sortMost').addEventListener('click',()=>{currentSort='most';$('sortMost').classList.add('active');$('sortAZ').classList.remove('active');renderCards()});$('sortAZ').addEventListener('click',()=>{currentSort='az';$('sortAZ').classList.add('active');$('sortMost').classList.remove('active');renderCards()});$('arrivalSortMost').addEventListener('click',()=>{arrivalSort='most';$('arrivalSortMost').classList.add('active');$('arrivalSortAZ').classList.remove('active');renderArrivalCards()});$('arrivalSortAZ').addEventListener('click',()=>{arrivalSort='az';$('arrivalSortAZ').classList.add('active');$('arrivalSortMost').classList.remove('active');renderArrivalCards()});$('undoBtn').addEventListener('click',undoLast);$('exportBtn').addEventListener('click',exportCsv);$('resetDayBtn').addEventListener('click',()=>{if(confirm('Reset today\'s progress counters? Workbook counts will not be restored.'))resetSurveyDay()});$('addAgentBtn').addEventListener('click',()=>{const n=$('newAgentName').value.trim();if(!n)return alert('Enter a surveyor name.');if(agents.some(a=>a.toLowerCase()===n.toLowerCase()))return alert('That surveyor already exists.');agents.push(n);$('newAgentName').value='';saveAll();fillSelects();renderAgents();renderManager()});$('newAgentName').addEventListener('keydown',e=>{if(e.key==='Enter')$('addAgentBtn').click()});$('resetActivityBtn').addEventListener('click',()=>{if(confirm('Reset demo activity and restore workbook counts?')){activity=[];depCom=cloneData(INITIAL_DEP_COM);arrivals=cloneData(INITIAL_ARRIVALS);saveAll();renderManager()}})}
 async function startApp(){
   const cloudState = await loadCloudState();
 
