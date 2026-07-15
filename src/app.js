@@ -17,7 +17,15 @@ let depCom=JSON.parse(localStorage.getItem('soa_depcom_'+STORAGE_SUFFIX)||'null'
 let arrivals=JSON.parse(localStorage.getItem('soa_arrivals_'+STORAGE_SUFFIX)||'null')||cloneData(INITIAL_ARRIVALS);
 let agents=JSON.parse(localStorage.getItem('soa_agents_'+STORAGE_SUFFIX)||'null')||DEFAULT_AGENTS.slice();
 let activity=JSON.parse(localStorage.getItem('soa_activity_'+STORAGE_SUFFIX)||'null')||[];
-let currentSurveyor='',currentSort='most',arrivalSort='most',currentRegion='All',arrivalRegion='All',lastAction=null,noticeTimer=null,pinnedDepComId=null;
+let currentSurveyor='',
+  currentSort='most',
+  arrivalSort='most',
+  currentRegion='All',
+  arrivalRegion='All',
+  lastAction=null,
+  noticeTimer=null,
+  pinnedDepComId=null,
+  reviewedWorkbook=null;
 function todayKey(){return new Date().toISOString().slice(0,10)}
 let currentDayKey=localStorage.getItem('soa_current_day_'+STORAGE_SUFFIX)||todayKey();
 function ensureCurrentDay(){const t=todayKey(); if(currentDayKey!==t){currentDayKey=t; localStorage.setItem('soa_current_day_'+STORAGE_SUFFIX,currentDayKey);}}
@@ -245,19 +253,104 @@ function resetSurveyDay(){
 function exportCsv(){const header=['SurveyDay','Time','Surveyor','SurveyType','Context','Code','City','Airport','Traffic','AboveGoal'];const rows=activity.map(a=>[a.dayKey||'Legacy',a.time,a.surveyor,a.type,a.context,a.code,a.city,a.airport,a.traffic,a.aboveGoal?'Yes':'No']);const csv=[header].concat(rows).map(row=>row.map(v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"').join(',')).join('\n');const blob=new Blob([csv],{type:'text/csv'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='surveyops_activity.csv';a.click();URL.revokeObjectURL(url)}
 function renderWorkbookReview(result){
   const s=result.summary;
-  $('workbookImportStatus').textContent='Workbook reviewed successfully. No survey data has been changed.';
+
+  $('workbookImportStatus').textContent=
+    'Workbook reviewed successfully. No survey data has been changed.';
+
   $('workbookImportSummary').innerHTML=
     '<div class="stats">'+
-      '<div class="stat"><strong>'+escapeHtml(result.fileName)+'</strong><span>Selected workbook</span></div>'+
-      '<div class="stat"><strong>'+s.departureRemainingTotal+'</strong><span>Departure surveys remaining</span></div>'+
-      '<div class="stat"><strong>'+s.commercialRemainingTotal+'</strong><span>Commercial surveys remaining</span></div>'+
-      '<div class="stat"><strong>'+s.arrivalRemainingTotal+'</strong><span>Arrival surveys remaining</span></div>'+
+      '<div class="stat">'+
+        '<strong>'+escapeHtml(result.fileName)+'</strong>'+
+        '<span>Selected workbook</span>'+
+      '</div>'+
+      '<div class="stat">'+
+        '<strong>'+s.departureRemainingTotal+'</strong>'+
+        '<span>Departure surveys remaining</span>'+
+      '</div>'+
+      '<div class="stat">'+
+        '<strong>'+s.commercialRemainingTotal+'</strong>'+
+        '<span>Commercial surveys remaining</span>'+
+      '</div>'+
+      '<div class="stat">'+
+        '<strong>'+s.arrivalRemainingTotal+'</strong>'+
+        '<span>Arrival surveys remaining</span>'+
+      '</div>'+
     '</div>'+
     '<div class="muted" style="margin-top:10px">'+
-      'Required airport/airline rows: '+s.departureRequired+' departures, '+
-      s.commercialRequired+' commercial, and '+s.arrivalRequired+' arrivals.<br>'+ 
+      'Required airport/airline rows: '+
+      s.departureRequired+' departures, '+
+      s.commercialRequired+' commercial, and '+
+      s.arrivalRequired+' arrivals.<br>'+
       'Zero-remaining and over-quota opportunities are retained in the reviewed data.'+
-    '</div>';
+    '</div>'+
+    '<button id="publishWorkbookBtn" class="big-btn" '+
+      'style="width:100%;margin-top:14px">'+
+      'Publish Workbook'+
+    '</button>';
+
+  $('publishWorkbookBtn').addEventListener(
+    'click',
+    handleWorkbookPublish
+  );
+}
+async function handleWorkbookPublish(){
+  if(!reviewedWorkbook){
+    alert('Review a workbook before publishing.');
+    return;
+  }
+
+  const confirmed=confirm(
+    'Publish '+reviewedWorkbook.fileName+'?\n\n'+
+    'This will replace the active survey list for all connected tablets.'
+  );
+
+  if(!confirmed)return;
+
+  const button=$('publishWorkbookBtn');
+
+  if(button){
+    button.disabled=true;
+    button.textContent='Publishing...';
+  }
+
+  const previousDepCom=cloneData(depCom);
+  const previousArrivals=cloneData(arrivals);
+
+  try{
+    depCom=cloneData(reviewedWorkbook.depCom);
+    arrivals=cloneData(reviewedWorkbook.arrivals);
+
+    await saveAll();
+
+    fillSelects();
+    renderCards();
+    renderArrivalCards();
+    renderManager();
+
+    $('workbookImportStatus').textContent=
+      'Workbook published successfully. The active survey list is saved locally and in Supabase.';
+
+    if(button){
+      button.textContent='Published';
+      button.disabled=true;
+    }
+  }catch(error){
+    depCom=previousDepCom;
+    arrivals=previousArrivals;
+
+    await saveAll();
+
+    console.error('Workbook publish failed:',error);
+
+    $('workbookImportStatus').textContent=
+      'Workbook publish failed: '+
+      (error.message||'Unknown error');
+
+    if(button){
+      button.disabled=false;
+      button.textContent='Publish Workbook';
+    }
+  }
 }
 
 async function handleWorkbookReview(){
@@ -273,8 +366,9 @@ async function handleWorkbookReview(){
   $('workbookImportSummary').innerHTML='';
 
   try{
-    const result=await reviewWorkbook(file,depCom,arrivals);
-    renderWorkbookReview(result);
+  const result=await reviewWorkbook(file,depCom,arrivals);
+reviewedWorkbook=result;
+renderWorkbookReview(result);
   }catch(error){
     console.error('Workbook review failed:',error);
     $('workbookImportStatus').textContent='Workbook review failed: '+(error.message||'Unknown error');

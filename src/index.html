@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>SurveyOps Air v0.35 Pilot</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div class="header">
+    <h1>SurveyOps Air</h1>
+    <p>ATL Customer Experience • Pilot v0.35 • Departures, Commercial & Arrivals</p>
+  </div>
+
+  <div class="wrap">
+    <section id="home" class="panel">
+      <h2>Choose Mode</h2>
+      <div class="mode-grid">
+        <button id="agentModeBtn" class="big-btn">Agent Workspace</button>
+        <button id="managerModeBtn" class="big-btn secondary">Operations Workspace</button>
+      </div>
+      <div class="warning">SurveyOps Air pilot with cloud storage and ASQ workbook data.</div>
+    </section>
+
+    <section id="agentLogin" class="panel hidden">
+      <div class="topbar"><h2>Agent Login</h2><button class="small-btn" data-go="home">Back</button></div>
+      <label for="surveyorSelect">Select your name</label>
+      <select id="surveyorSelect"></select>
+      <button id="startAgentBtn" class="big-btn" style="width:100%;margin-top:14px">Continue</button>
+    </section>
+
+    <section id="workType" class="panel hidden">
+      <div class="topbar">
+        <div><h2 id="workTypeWelcome">Welcome</h2><div class="muted">Choose the type of survey work.</div></div>
+        <button class="small-btn" data-go="home">Exit</button>
+      </div>
+      <div class="worktype-grid">
+        <div class="worktype-card">
+          <h3>✈ Departures + 🛍 Commercial</h3>
+          <p class="muted">Select airline, search city or airport, and log departure or commercial surveys on the same card.</p>
+          <button id="openDepComBtn" class="big-btn" style="width:100%">Open Work Board</button>
+        </div>
+        <div class="worktype-card">
+          <h3>🛬 Arrivals</h3>
+          <p class="muted">Select an arrival time window, search the origin city or airport, and log arrival surveys.</p>
+          <button id="openArrivalsBtn" class="big-btn arrival" style="width:100%">Open Arrivals</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="depComApp" class="hidden">
+      <div class="panel">
+        <div class="topbar">
+          <div><h2 id="depComWelcome">Welcome</h2><div class="muted">Departure + Commercial Surveys</div></div>
+          <button class="small-btn" data-go="workType">Back</button>
+        </div>
+        <div id="depComProgress" class="stats" style="margin-top:12px"></div>
+        <label for="airlineSelect">Airline</label><select id="airlineSelect"></select>
+        <label>Domestic / International</label>
+        <div class="tabs">
+          <button class="small-btn active" id="regionAll">All</button>
+          <button class="small-btn" id="regionDomestic">Domestic</button>
+          <button class="small-btn" id="regionInternational">International</button>
+        </div>
+        <label for="searchBox">Search city or airport</label>
+        <input id="searchBox" autocomplete="off" placeholder="Search city or airport..." />
+        <div class="tabs">
+          <button class="small-btn active" id="sortMost">Most Needed</button>
+          <button class="small-btn" id="sortAZ">A-Z</button>
+          <button class="small-btn" id="sortOversample">Oversample</button>
+        </div>
+      </div>
+      <div id="cards"></div>
+    </section>
+
+    <section id="arrivalsApp" class="hidden">
+      <div class="panel">
+        <div class="topbar">
+          <div><h2 id="arrivalsWelcome">Welcome</h2><div class="muted">Arrival Surveys</div></div>
+          <button class="small-btn" data-go="workType">Back</button>
+        </div>
+        <div id="arrivalProgress" class="stats" style="margin-top:12px"></div>
+        <label for="windowSelect">Arrival Window</label><select id="windowSelect"></select>
+        <label>Domestic / International</label>
+        <div class="tabs">
+          <button class="small-btn active" id="arrivalRegionAll">All</button>
+          <button class="small-btn" id="arrivalRegionDomestic">Domestic</button>
+          <button class="small-btn" id="arrivalRegionInternational">International</button>
+        </div>
+        <label for="arrivalSearchBox">Search city or airport</label>
+        <input id="arrivalSearchBox" autocomplete="off" placeholder="Search city or airport..." />
+        <div class="tabs">
+          <button class="small-btn active" id="arrivalSortMost">Most Needed</button>
+          <button class="small-btn" id="arrivalSortAZ">A-Z</button>
+          <button class="small-btn" id="arrivalSortOversample">Oversample</button>
+        </div>
+      </div>
+      <div id="arrivalCards"></div>
+    </section>
+
+    <section id="managerLogin" class="panel hidden">
+      <div class="topbar"><h2>Operations Workspace</h2><button class="small-btn" data-go="home">Back</button></div>
+      <label for="pinInput">Manager PIN</label>
+      <input id="pinInput" type="password" inputmode="numeric" placeholder="Enter PIN" />
+      <button id="managerLoginBtn" class="big-btn" style="width:100%;margin-top:14px">Open Dashboard</button>
+      <p class="muted">Demo PIN: 2026</p>
+    </section>
+
+    <section id="managerApp" class="hidden">
+      <div class="panel topbar">
+        <div><h2>Operations Dashboard</h2><div class="muted">Live survey totals and workbook management</div><div class="meta" id="sourceMeta"></div></div>
+        <button class="small-btn" data-go="home">Exit</button>
+      </div>
+
+      <div class="panel">
+        <h3>ASQ Survey Workbook</h3>
+        <p class="muted">Upload the complete, unfiltered ASQ Excel workbook. Rows with zero remaining will be retained for oversampling.</p>
+        <input id="workbookInput" type="file" accept=".xlsx,.xls" />
+        <div class="row" style="margin-top:12px">
+          <button id="reviewWorkbookBtn" class="small-btn green">Review Workbook</button>
+          <button id="publishWorkbookBtn" class="small-btn warning hidden" disabled>Publish Workbook</button>
+        </div>
+        <div id="workbookImportStatus" class="muted" style="margin-top:12px">No workbook selected.</div>
+        <div id="workbookImportSummary" style="margin-top:12px"></div>
+      </div>
+
+      <div class="panel"><h3>Operation Summary</h3><div class="stats" id="summaryStats"></div></div>
+      <div class="panel"><h3>Completed by Surveyor</h3><div id="surveyorStats"></div></div>
+      <div class="panel"><h3>Completed by Survey Type</h3><div id="typeStats"></div></div>
+      <div class="panel"><h3>Completed by Airline / Arrival Window</h3><div id="contextStats"></div></div>
+
+      <div class="panel">
+        <h3>Manage Surveyors</h3>
+        <p class="muted">Add, edit, or delete names from the Agent Workspace login dropdown. Deleting a name does not remove historical activity.</p>
+        <div class="row"><input id="newAgentName" placeholder="Add surveyor name"/><button id="addAgentBtn" class="small-btn green">Add</button></div>
+        <div id="agentList" style="margin-top:10px"></div>
+      </div>
+
+      <div class="panel">
+        <h3>Activity Log</h3>
+        <div class="row">
+          <button id="exportBtn" class="small-btn green">Export CSV</button>
+          <button id="resetDayBtn" class="small-btn warning">Reset Survey Day</button>
+          <button id="resetActivityBtn" class="small-btn danger">Reset Demo Activity</button>
+        </div>
+        <div class="muted" style="margin-top:8px">Reset Survey Day clears today's progress counters without restoring workbook counts. Activity history remains in the log.</div>
+        <div id="activityTable" style="margin-top:10px;overflow:auto"></div>
+      </div>
+    </section>
+  </div>
+
+  <div id="notice" class="notice">✓ Saved <button id="undoBtn">Undo</button></div>
+  <script type="module" src="/src/app.js"></script>
+</body>
+</html>
