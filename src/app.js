@@ -1,7 +1,19 @@
 import {
   loadCloudState,
   saveCloudState,
-  saveSurveyRecord
+  saveSurveyRecord,
+  loadShifts,
+  loadEmployees,
+  saveEmployee,
+  deleteEmployee,
+  loadEmployeeSchedule,
+  saveEmployeeSchedule,
+  loadAirlines,
+  loadAssignmentsForWeek,
+  saveDailyAssignment,
+  loadManagerMessages,
+  saveManagerMessage,
+  deactivateManagerMessage
 } from './lib/storage.js';
 import { reviewWorkbook } from './lib/workbook.js';
 const STORAGE_SUFFIX='mvp_arrivals_20260629_v035_arrival_over_goal';
@@ -15,7 +27,19 @@ const DEFAULT_AGENTS=['Troy','Falana','Kaba','Khursheeda','Phillip'];
 function cloneData(x){return JSON.parse(JSON.stringify(x))}
 let depCom=JSON.parse(localStorage.getItem('soa_depcom_'+STORAGE_SUFFIX)||'null')||cloneData(INITIAL_DEP_COM);
 let arrivals=JSON.parse(localStorage.getItem('soa_arrivals_'+STORAGE_SUFFIX)||'null')||cloneData(INITIAL_ARRIVALS);
-let agents=JSON.parse(localStorage.getItem('soa_agents_'+STORAGE_SUFFIX)||'null')||DEFAULT_AGENTS.slice();
+let agents=JSON.parse(
+  localStorage.getItem('soa_agents_'+STORAGE_SUFFIX) || 'null'
+) || DEFAULT_AGENTS.slice();
+
+let employees=[];
+let shifts=[];
+let assignmentAirlines=[];
+let assignmentsForDate=[];
+let assignmentsForSummaryWeek=[];
+let schedulesByEmployee=new Map();
+let agentAssignment=null;
+let managerMessages=[];
+
 let activity=JSON.parse(localStorage.getItem('soa_activity_'+STORAGE_SUFFIX)||'null')||[];
 let currentSurveyor='',
   currentSort='most',
@@ -25,11 +49,22 @@ let currentSurveyor='',
   lastAction=null,
   noticeTimer=null,
   pinnedDepComId=null,
+  pinnedDepComIndex=null,
   reviewedWorkbook=null;
 function todayKey(){return new Date().toISOString().slice(0,10)}
 let currentDayKey=localStorage.getItem('soa_current_day_'+STORAGE_SUFFIX)||todayKey();
 function ensureCurrentDay(){const t=todayKey(); if(currentDayKey!==t){currentDayKey=t; localStorage.setItem('soa_current_day_'+STORAGE_SUFFIX,currentDayKey);}}
-function todayActivity(){ensureCurrentDay(); return activity.filter(a=>a.dayKey===currentDayKey)}
+function countableActivity(){
+  return activity.filter(item=>
+    item.action!=='Undo' &&
+    item.action!=='System' &&
+    item.voided!==true
+  );
+}
+function todayActivity(){
+  ensureCurrentDay();
+  return countableActivity().filter(a=>a.dayKey===currentDayKey);
+}
 function $(id){return document.getElementById(id)}
 function saveAll(){
   const state = { depCom, arrivals, agents, activity, currentDayKey };
@@ -42,11 +77,152 @@ function saveAll(){
 
   saveCloudState(state);
 }
-function show(id){['home','agentLogin','workType','depComApp','arrivalsApp','managerLogin','managerApp'].forEach(x=>$(x).classList.add('hidden'));$(id).classList.remove('hidden');if(id==='managerApp')renderManager();if(id==='depComApp')renderCards();if(id==='arrivalsApp')renderArrivalCards();}
+function show(id){
+  ['home','agentLogin','workType','depComApp','arrivalsApp','managerLogin','managerApp']
+    .forEach(x=>$(x).classList.add('hidden'));
+
+  $(id).classList.remove('hidden');
+
+  if(id==='managerApp')renderManager();
+  if(id==='workType')renderAgentAssignment();
+  if(id==='depComApp')renderCards();
+  if(id==='arrivalsApp')renderArrivalCards();
+}
 function escapeHtml(s){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
 function totalStillNeeded(r){return (r.departureRemaining||0)+(r.commercialRemaining||0)}
-function airlineOptions(){const m=new Map();depCom.forEach(r=>m.set(r.airline,r.airlineName||r.airline));return Array.from(m.entries()).sort((a,b)=>a[1].localeCompare(b[1]));}
-function fillSelects(){ $('surveyorSelect').innerHTML=agents.map(a=>'<option value="'+escapeHtml(a)+'">'+escapeHtml(a)+'</option>').join(''); $('airlineSelect').innerHTML=airlineOptions().map(([code,name])=>'<option value="'+escapeHtml(code)+'">'+escapeHtml(name)+'</option>').join(''); $('windowSelect').innerHTML=ARRIVAL_WINDOWS.map(w=>'<option value="'+escapeHtml(w)+'">'+escapeHtml(w)+'</option>').join('');}
+function airlineRequirementStatus(code){
+  const normalized=String(code || '').toUpperCase();
+  const rows=depCom.filter(
+    row=>String(row.airline || '').toUpperCase()===normalized
+  );
+  const sum=key=>rows.reduce(
+    (total,row)=>total+Number(row[key] || 0),
+    0
+  );
+  const departureRemaining=sum('departureRemaining');
+  const commercialRemaining=sum('commercialRemaining');
+  const officialTotal=
+    sum('departureTargetOriginal')+
+    sum('departureTargetModified')+
+    sum('departureCompletedTargets')+
+    sum('commercialTargetOriginal')+
+    sum('commercialTargetModified')+
+    sum('commercialCompletedTargets');
+  const officialAvailable=officialTotal>0;
+  const complete=
+    officialAvailable &&
+    departureRemaining===0 &&
+    commercialRemaining===0;
+  const rank=!officialAvailable
+    ? 3
+    : complete
+      ? 2
+      : departureRemaining>0 && commercialRemaining>0
+        ? 0
+        : 1;
+
+  return {
+    departureRemaining,
+    commercialRemaining,
+    officialAvailable,
+    complete,
+    rank
+  };
+}
+
+function airlineStatusEntries(list){
+  return list
+    .map(item=>{
+      const status=airlineRequirementStatus(item.code);
+      return {...item,status};
+    })
+    .sort((a,b)=>
+      a.status.rank-b.status.rank ||
+      a.name.localeCompare(b.name)
+    );
+}
+
+function airlineStatusLabel(entry){
+  const prefix=entry.code ? entry.code+' — ' : '';
+
+  if(!entry.status.officialAvailable){
+    return prefix+entry.name;
+  }
+
+  if(entry.status.complete){
+    return '✓ '+prefix+entry.name+' — Minimums satisfied';
+  }
+
+  return prefix+entry.name+
+    ' — D '+entry.status.departureRemaining+
+    ' | C '+entry.status.commercialRemaining;
+}
+
+function airlineStatusOptions(entries,selectedId,{includeBlank=false}={}){
+  const groups=[
+    {label:'Needs Departure and Commercial',rank:0},
+    {label:'Needs One Survey Type',rank:1},
+    {label:'Minimums Satisfied',rank:2},
+    {label:'ASQ Status Unavailable',rank:3}
+  ];
+  const blank=includeBlank
+    ? '<option value="">No focus airline</option>'
+    : '';
+
+  return blank+groups.map(group=>{
+    const options=entries
+      .filter(entry=>entry.status.rank===group.rank)
+      .map(entry=>
+        '<option value="'+escapeHtml(entry.id)+'"'+
+          (entry.id===selectedId ? ' selected' : '')+'>'+ 
+          escapeHtml(airlineStatusLabel(entry))+
+        '</option>'
+      )
+      .join('');
+
+    return options
+      ? '<optgroup label="'+escapeHtml(group.label)+'">'+options+'</optgroup>'
+      : '';
+  }).join('');
+}
+
+function airlineOptions(){
+  const airlinesByCode=new Map();
+  depCom.forEach(row=>airlinesByCode.set(
+    row.airline,
+    row.airlineName || row.airline
+  ));
+
+  return airlineStatusEntries(
+    Array.from(airlinesByCode.entries()).map(([code,name])=>({
+      id:code,
+      code,
+      name
+    }))
+  );
+}
+
+function refreshAgentAirlineSelect(selectedCode){
+  const select=$('airlineSelect');
+  if(!select)return;
+
+  const previous=selectedCode || select.value;
+  select.innerHTML=airlineStatusOptions(airlineOptions(),previous);
+
+  if(previous && Array.from(select.options).some(option=>option.value===previous)){
+    select.value=previous;
+  }
+}
+
+function fillSelects(){
+  $('surveyorSelect').innerHTML=agents.map(a=>
+    '<option value="'+escapeHtml(a)+'">'+escapeHtml(a)+'</option>'
+  ).join('');
+  refreshAgentAirlineSelect();
+  $('windowSelect').innerHTML=ARRIVAL_WINDOWS.map(w=>
+    '<option value="'+escapeHtml(w)+'">'+escapeHtml(w)+'</option>'
+  ).join('');
+}
 function priorityClass(n){if(n>=5)return'high';if(n>=2)return'mid';return'low'}
 function filteredRequirements(){
   const airline=$('airlineSelect').value;
@@ -65,13 +241,20 @@ function filteredRequirements(){
   if(currentSort==='az'){
     arr.sort((a,b)=>(a.city||a.code).localeCompare(b.city||b.code));
   }else{
-    arr.sort((a,b)=>{
-      if(a.id===pinnedDepComId && b.id!==pinnedDepComId)return -1;
-      if(b.id===pinnedDepComId && a.id!==pinnedDepComId)return 1;
+    arr.sort((a,b)=>
+      (totalStillNeeded(b)-totalStillNeeded(a)) ||
+      ((a.city||a.code).localeCompare(b.city||b.code))
+    );
 
-      return (totalStillNeeded(b)-totalStillNeeded(a))
-        ||((a.city||a.code).localeCompare(b.city||b.code));
-    });
+    if(pinnedDepComId!==null && pinnedDepComIndex!==null){
+      const currentIndex=arr.findIndex(item=>item.id===pinnedDepComId);
+
+      if(currentIndex>=0){
+        const [pinned]=arr.splice(currentIndex,1);
+        const targetIndex=Math.min(pinnedDepComIndex,arr.length);
+        arr.splice(targetIndex,0,pinned);
+      }
+    }
   }
 
   return arr;
@@ -113,6 +296,13 @@ function addSurvey(id){
 
   if(!r)return;
 
+  if(type!=='arrival' && currentSort==='most'){
+    const visibleBeforeUpdate=filteredRequirements();
+    const clickedIndex=visibleBeforeUpdate.findIndex(item=>item.id===baseId);
+    pinnedDepComId=baseId;
+    pinnedDepComIndex=clickedIndex>=0?clickedIndex:null;
+  }
+
   const wasAbove=(r[remKey]||0)<=0;
 
   if((r[remKey]||0)>0){
@@ -126,6 +316,9 @@ function addSurvey(id){
   const now=new Date();
 
   const rec={
+    auditId:
+      (globalThis.crypto?.randomUUID?.()) ||
+      ('audit-'+Date.now()+'-'+Math.random().toString(16).slice(2)),
     dayKey:currentDayKey,
     time:now.toLocaleString(),
     surveyor:currentSurveyor,
@@ -135,15 +328,15 @@ function addSurvey(id){
     city:r.city,
     airport:r.airport,
     traffic:r.traffic,
-    aboveGoal:wasAbove
+    aboveGoal:wasAbove,
+    action:'Recorded',
+    status:'Active',
+    voided:false
   };
 
   activity.push(rec);
-  lastAction={id:baseId,type,wasAbove};
+  lastAction={id:baseId,type,wasAbove,auditId:rec.auditId};
 
-  if(type!=='arrival' && currentSort==='most'){
-    pinnedDepComId=baseId;
-  }
 
   saveAll();
 
@@ -165,6 +358,7 @@ function addSurvey(id){
   if(type==='arrival'){
     renderArrivalCards();
   }else{
+    refreshAgentAirlineSelect(r.airline);
     renderCards();
   }
 
@@ -172,9 +366,70 @@ function addSurvey(id){
 }
 
 function showNotice(){clearTimeout(noticeTimer);$('notice').style.display='block';noticeTimer=setTimeout(()=>{$('notice').style.display='none';lastAction=null},5000)}
-function undoLast(){if(!lastAction)return;let r, remKey, aboveKey;if(lastAction.type==='arrival'){r=arrivals.find(x=>x.id===lastAction.id);remKey='arrivalRemaining';aboveKey='arrivalAboveGoal';}else{r=depCom.find(x=>x.id===lastAction.id);remKey=lastAction.type+'Remaining';aboveKey=lastAction.type+'AboveGoal';}if(r){if(lastAction.wasAbove&&(r[aboveKey]||0)>0)r[aboveKey]-=1;else r[remKey]=(r[remKey]||0)+1;}activity.pop();lastAction=null;$('notice').style.display='none';saveAll();renderCards();renderArrivalCards();}
+function undoLast(){
+  if(!lastAction)return;
+
+  let r;
+  let remKey;
+  let aboveKey;
+
+  if(lastAction.type==='arrival'){
+    r=arrivals.find(x=>x.id===lastAction.id);
+    remKey='arrivalRemaining';
+    aboveKey='arrivalAboveGoal';
+  }else{
+    r=depCom.find(x=>x.id===lastAction.id);
+    remKey=lastAction.type+'Remaining';
+    aboveKey=lastAction.type+'AboveGoal';
+  }
+
+  if(r){
+    if(lastAction.wasAbove && (r[aboveKey]||0)>0){
+      r[aboveKey]-=1;
+    }else{
+      r[remKey]=(r[remKey]||0)+1;
+    }
+  }
+
+  const original=activity.find(
+    item=>item.auditId===lastAction.auditId
+  );
+  const now=new Date();
+
+  if(original){
+    original.voided=true;
+    original.status='Voided';
+    original.voidedAt=now.toISOString();
+
+    activity.push({
+      auditId:
+        (globalThis.crypto?.randomUUID?.()) ||
+        ('audit-'+Date.now()+'-'+Math.random().toString(16).slice(2)),
+      dayKey:original.dayKey,
+      time:now.toLocaleString(),
+      surveyor:original.surveyor,
+      type:original.type,
+      context:original.context,
+      code:original.code,
+      city:original.city,
+      airport:original.airport,
+      traffic:original.traffic,
+      aboveGoal:original.aboveGoal,
+      action:'Undo',
+      status:'Audit Event',
+      voidsAuditId:original.auditId
+    });
+  }
+
+  lastAction=null;
+  $('notice').style.display='none';
+  saveAll();
+  refreshAgentAirlineSelect();
+  renderCards();
+  renderArrivalCards();
+}
 function countBy(arr,key){const out={};arr.forEach(a=>{out[a[key]]=(out[a[key]]||0)+1});return Object.entries(out).sort((a,b)=>b[1]-a[1])}
-function tableCounts(id,rows,label){$(id).innerHTML=rows.length?'<table><thead><tr><th>'+label+'</th><th>Completed</th></tr></thead><tbody>'+rows.map(r=>'<tr><td>'+escapeHtml(r[0])+'</td><td>'+r[1]+'</td></tr>').join('')+'</tbody></table>':'<div class="muted">No activity yet.</div>'}
+function tableCounts(id,rows,label){$(id).innerHTML=rows.length?'<table><thead><tr><th>'+label+'</th><th>Recorded</th></tr></thead><tbody>'+rows.map(r=>'<tr><td>'+escapeHtml(r[0])+'</td><td>'+r[1]+'</td></tr>').join('')+'</tbody></table>':'<div class="muted">No activity yet.</div>'}
 function userTypeCount(type){return todayActivity().filter(a=>a.surveyor===currentSurveyor && a.type===type).length}
 function userTotalCount(){return todayActivity().filter(a=>a.surveyor===currentSurveyor).length}
 function renderUserProgress(){
@@ -184,6 +439,7 @@ function renderUserProgress(){
     '<div class="stat"><div class="muted">My Total</div><div class="num">'+userTotalCount()+'</div></div>';
   if($('depComProgress')) $('depComProgress').innerHTML=html;
   if($('arrivalProgress')) $('arrivalProgress').innerHTML=html;
+  if($('agentAssignmentSummary'))renderAgentAssignment();
 }
 function setRegion(kind,value){
   if(kind==='depcom'){
@@ -198,59 +454,1701 @@ function setRegion(kind,value){
     renderArrivalCards();
   }
 }
+function syncAgentsFromEmployees(){
+  agents=employees
+    .filter(employee=>employee.active !== false)
+    .map(employee=>employee.name)
+    .sort((a,b)=>a.localeCompare(b));
 
-function renderManager(){ensureCurrentDay(); const todays=todayActivity(); const completed=todays.length,above=todays.filter(a=>a.aboveGoal).length,depRemaining=depCom.reduce((s,r)=>s+(r.departureRemaining||0),0),commRemaining=depCom.reduce((s,r)=>s+(r.commercialRemaining||0),0),arrRemaining=arrivals.reduce((s,r)=>s+(r.arrivalRemaining||0),0);$('sourceMeta').textContent='Survey Day: '+currentDayKey+' • '+META.sourceFile+' • '+META.depComCards+' departure/commercial cards • '+META.arrivalRecords+' arrival records';$('summaryStats').innerHTML='<div class="stat"><div class="muted">Completed</div><div class="num">'+completed+'</div></div><div class="stat"><div class="muted">Above Goal</div><div class="num">'+above+'</div></div><div class="stat"><div class="muted">Departures Needed</div><div class="num">'+depRemaining+'</div></div><div class="stat"><div class="muted">Commercial Needed</div><div class="num">'+commRemaining+'</div></div><div class="stat"><div class="muted">Arrivals Needed</div><div class="num">'+arrRemaining+'</div></div>';tableCounts('surveyorStats',countBy(todays,'surveyor'),'Surveyor');tableCounts('typeStats',countBy(todays,'type'),'Survey Type');tableCounts('contextStats',countBy(todays,'context'),'Airline / Window');renderAgents();renderActivity();}
+  localStorage.setItem(
+    'soa_agents_'+STORAGE_SUFFIX,
+    JSON.stringify(agents)
+  );
+}
+
+async function refreshEmployees(){
+  employees=await loadEmployees();
+  shifts=await loadShifts();
+  assignmentAirlines=await loadAirlines();
+  const scheduleEntries=await Promise.all(
+    employees.map(async employee=>[
+      employee.id,
+      await loadEmployeeSchedule(employee.id)
+    ])
+  );
+  schedulesByEmployee=new Map(scheduleEntries);
+
+  syncAgentsFromEmployees();
+  fillSelects();
+}
+
+async function migrateLegacyAgents(){
+  const existingEmployees=await loadEmployees();
+
+  if(existingEmployees.length){
+    employees=existingEmployees;
+    shifts=await loadShifts();
+    assignmentAirlines=await loadAirlines();
+    const scheduleEntries=await Promise.all(
+      employees.map(async employee=>[
+        employee.id,
+        await loadEmployeeSchedule(employee.id)
+      ])
+    );
+    schedulesByEmployee=new Map(scheduleEntries);
+    syncAgentsFromEmployees();
+    return;
+  }
+
+  for(const name of agents){
+    try{
+      await saveEmployee({
+        name,
+        shift_id:null,
+        team_role:'Surveyor',
+        active:true
+      });
+    }catch(error){
+      console.error(
+        'Could not migrate surveyor:',
+        name,
+        error
+      );
+    }
+  }
+
+  await refreshEmployees();
+}
+
+function employeeShiftName(employee){
+  return employee.shifts?.name || 'Shift not assigned';
+}
+
+function renderActivity(){
+  const rows=activity.slice().reverse().slice(0,75);
+  $('activityTable').innerHTML=rows.length
+    ? '<table><thead><tr>'+
+        '<th>Survey Day</th><th>Time</th><th>Surveyor</th>'+
+        '<th>Action</th><th>Status</th><th>Type</th>'+
+        '<th>Airline/Window</th><th>Airport</th>'+
+      '</tr></thead><tbody>'+
+      rows.map(a=>
+        '<tr>'+
+          '<td>'+escapeHtml(a.dayKey||'Legacy')+'</td>'+
+          '<td>'+escapeHtml(a.time)+'</td>'+
+          '<td>'+escapeHtml(a.surveyor)+'</td>'+
+          '<td>'+escapeHtml(a.action||'Recorded')+'</td>'+
+          '<td>'+escapeHtml(a.status||(a.voided?'Voided':'Active'))+'</td>'+
+          '<td>'+escapeHtml(a.aboveGoal?a.type+' Above Goal':a.type)+'</td>'+
+          '<td>'+escapeHtml(a.context)+'</td>'+
+          '<td>'+escapeHtml(a.city)+'</td>'+
+        '</tr>'
+      ).join('')+
+      '</tbody></table>'
+    : '<div class="muted">No activity yet.</div>';
+}
+
+function resetSurveyDay(){
+  alert(
+    'Survey work-log history is protected and cannot be reset. '+
+    'Entries remain available in Activity and CSV export.'
+  );
+}
+function renderManager(){
+  ensureCurrentDay();
+
+  const todays=todayActivity();
+  const completed=todays.length;
+  const above=todays.filter(a=>a.aboveGoal).length;
+  const depRemaining=depCom.reduce((sum,row)=>sum+(row.departureRemaining||0),0);
+  const commRemaining=depCom.reduce((sum,row)=>sum+(row.commercialRemaining||0),0);
+  const arrRemaining=arrivals.reduce((sum,row)=>sum+(row.arrivalRemaining||0),0);
+
+  $('sourceMeta').textContent=
+    'Survey Day: '+currentDayKey+' • '+META.sourceFile+' • '+
+    META.depComCards+' departure/commercial cards • '+
+    META.arrivalRecords+' arrival records';
+
+  $('summaryStats').innerHTML=
+    '<div class="stat"><div class="muted">Recorded</div><div class="num">'+completed+'</div></div>'+ 
+    '<div class="stat"><div class="muted">Above Goal</div><div class="num">'+above+'</div></div>'+ 
+    '<div class="stat"><div class="muted">Departures Needed</div><div class="num">'+depRemaining+'</div></div>'+ 
+    '<div class="stat"><div class="muted">Commercial Needed</div><div class="num">'+commRemaining+'</div></div>'+ 
+    '<div class="stat"><div class="muted">Arrivals Needed</div><div class="num">'+arrRemaining+'</div></div>';
+
+  tableCounts('surveyorStats',countBy(todays,'surveyor'),'Surveyor');
+  tableCounts('typeStats',countBy(todays,'type'),'Survey Type');
+  tableCounts('contextStats',countBy(todays,'context'),'Airline / Window');
+  renderAgents();
+  void renderAssignments();
+  renderActivity();
+}
+
 function renderAgents(){
-  $('agentList').innerHTML=agents.map((a,i)=>
-    '<div class="row" style="margin:6px 0">'+
-      '<div><strong>'+escapeHtml(a)+'</strong></div>'+
-      '<button class="small-btn" data-agent-edit="'+i+'">Edit</button>'+
-      '<button class="small-btn danger" data-agent-delete="'+i+'">Delete</button>'+
+  const list=$('agentList');
+
+  if(!employees.length){
+    list.innerHTML=
+      '<div class="muted">No employees have been added.</div>';
+    return;
+  }
+
+  const shiftOptions=shifts.map(shift=>
+    '<option value="'+shift.id+'">'+
+      escapeHtml(shift.name)+
+    '</option>'
+  ).join('');
+
+  const scheduleDays=[
+    {label:'Sat',weekday:6},
+    {label:'Sun',weekday:7},
+    {label:'Mon',weekday:1},
+    {label:'Tue',weekday:2},
+    {label:'Wed',weekday:3},
+    {label:'Thu',weekday:4},
+    {label:'Fri',weekday:5}
+  ];
+
+  list.innerHTML=employees.map(employee=>
+    '<div style="margin:10px 0;padding:12px 0;border-bottom:1px solid #e2e7ee">'+
+
+      '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'+
+
+      '<div style="flex:1 1 170px;min-width:150px">'+
+        '<strong>'+escapeHtml(employee.name)+'</strong>'+
+        (employee.active
+          ? ''
+          : '<div class="muted" style="font-size:12px">Inactive</div>'
+        )+
+      '</div>'+
+
+      '<select class="input" '+
+        'data-agent-shift="'+employee.id+'" '+
+        'style="flex:1 1 220px;min-width:210px;max-width:280px">'+
+        '<option value="">Shift not assigned</option>'+
+        shiftOptions+
+      '</select>'+
+
+      '<button class="small-btn" '+
+        'style="flex:0 0 105px" '+
+        'data-agent-save="'+employee.id+'">'+
+        'Save'+
+      '</button>'+
+
+      '<button class="small-btn" '+
+        'style="flex:0 0 105px" '+
+        'data-agent-edit="'+employee.id+'">'+
+        'Edit'+
+      '</button>'+
+
+      '<button class="small-btn danger" '+
+        'style="flex:0 0 105px" '+
+        'data-agent-delete="'+employee.id+'">'+
+        'Delete'+
+      '</button>'+
+
+      '</div>'+
+
+      '<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:10px">'+
+        '<span class="muted" style="font-size:12px;min-width:58px">OFF DAYS:</span>'+
+        scheduleDays.map(day=>{
+          const schedule=schedulesByEmployee.get(employee.id) || [];
+          const saved=scheduleForWeekday(schedule,day.weekday);
+          const checked=saved && saved.working===false;
+
+          return (
+            '<label style="font-size:13px;white-space:nowrap;display:flex;align-items:center;gap:4px">'+
+              '<input type="checkbox" '+
+                'data-agent-off-day="'+employee.id+'" '+
+                'value="'+day.weekday+'"'+
+                (checked ? ' checked' : '')+
+              '> '+day.label+
+            '</label>'
+          );
+        }).join('')+
+      '</div>'+
+
     '</div>'
   ).join('');
 
-  document.querySelectorAll('[data-agent-edit]').forEach(b=>b.addEventListener('click',()=>{
-    const i=+b.dataset.agentEdit;
-    const current=agents[i];
-    const updated=prompt('Edit surveyor name:', current);
-    if(updated===null)return;
-    const name=updated.trim();
-    if(!name)return alert('Surveyor name cannot be blank.');
-    if(agents.some((a,idx)=>idx!==i && a.toLowerCase()===name.toLowerCase()))return alert('That surveyor already exists.');
-    agents[i]=name;
-    if(currentSurveyor===current)currentSurveyor=name;
-    saveAll();
-    fillSelects();
-    renderAgents();
-    renderManager();
-  }));
+  employees.forEach(employee=>{
+    const select=document.querySelector(
+      '[data-agent-shift="'+employee.id+'"]'
+    );
 
-  document.querySelectorAll('[data-agent-delete]').forEach(b=>b.addEventListener('click',()=>{
-    const i=+b.dataset.agentDelete;
-    const name=agents[i];
-    if(!confirm('Delete surveyor "'+name+'" from the login list? Historical activity will remain.'))return;
-    agents.splice(i,1);
-    if(currentSurveyor===name)currentSurveyor='';
-    saveAll();
-    fillSelects();
-    renderAgents();
-    renderManager();
-  }));
+    if(select){
+      select.value=employee.shift_id || '';
+    }
+  });
+
+  document
+    .querySelectorAll('[data-agent-save]')
+    .forEach(button=>{
+      button.addEventListener('click',async()=>{
+        const employee=employees.find(
+          item=>item.id===button.dataset.agentSave
+        );
+
+        if(!employee)return;
+
+        const select=document.querySelector(
+          '[data-agent-shift="'+employee.id+'"]'
+        );
+
+        const shiftId=select?.value || null;
+        const offDays=new Set(
+          Array.from(document.querySelectorAll(
+            '[data-agent-off-day="'+employee.id+'"]:checked'
+          )).map(input=>Number(input.value))
+        );
+        const schedule=[
+          {weekday:1,working:!offDays.has(1)},
+          {weekday:2,working:!offDays.has(2)},
+          {weekday:3,working:!offDays.has(3)},
+          {weekday:4,working:!offDays.has(4)},
+          {weekday:5,working:!offDays.has(5)},
+          {weekday:6,working:!offDays.has(6)},
+          {weekday:7,working:!offDays.has(7)}
+        ];
+        const originalText=button.textContent;
+
+        button.disabled=true;
+        button.textContent='Saving...';
+
+        try{
+          await saveEmployee({
+            ...employee,
+            shift_id:shiftId
+          });
+          await saveEmployeeSchedule(employee.id,schedule);
+
+          await refreshEmployees();
+          renderManager();
+        }catch(error){
+          console.error('Shift assignment failed:',error);
+
+          alert(
+            'The shift could not be saved. '+
+            (error.message || '')
+          );
+
+          button.disabled=false;
+          button.textContent=originalText;
+        }
+      });
+    });
+
+  document
+    .querySelectorAll('[data-agent-edit]')
+    .forEach(button=>{
+      button.addEventListener('click',async()=>{
+        const employee=employees.find(
+          item=>item.id===button.dataset.agentEdit
+        );
+
+        if(!employee)return;
+
+        const updated=prompt(
+          'Edit surveyor name:',
+          employee.name
+        );
+
+        if(updated===null)return;
+
+        const name=updated.trim();
+
+        if(!name){
+          alert('Surveyor name cannot be blank.');
+          return;
+        }
+
+        const duplicate=employees.some(item=>
+          item.id!==employee.id &&
+          item.name.toLowerCase()===name.toLowerCase()
+        );
+
+        if(duplicate){
+          alert('That surveyor already exists.');
+          return;
+        }
+
+        try{
+          await saveEmployee({
+            ...employee,
+            name
+          });
+
+          if(currentSurveyor===employee.name){
+            currentSurveyor=name;
+          }
+
+          await refreshEmployees();
+          renderManager();
+        }catch(error){
+          console.error('Surveyor update failed:',error);
+
+          alert(
+            'The surveyor could not be updated. '+
+            (error.message || '')
+          );
+        }
+      });
+    });
+
+  document
+    .querySelectorAll('[data-agent-delete]')
+    .forEach(button=>{
+      button.addEventListener('click',async()=>{
+        const employee=employees.find(
+          item=>item.id===button.dataset.agentDelete
+        );
+
+        if(!employee)return;
+
+        const confirmed=confirm(
+          'Delete surveyor "'+employee.name+'"?\n\n'+
+          'Historical survey activity will remain.'
+        );
+
+        if(!confirmed)return;
+
+        try{
+          await deleteEmployee(employee.id);
+
+          if(currentSurveyor===employee.name){
+            currentSurveyor='';
+          }
+
+          await refreshEmployees();
+          renderManager();
+        }catch(error){
+          console.error('Surveyor deletion failed:',error);
+
+          alert(
+            'The surveyor could not be deleted. '+
+            (error.message || '')
+          );
+        }
+      });
+    });
 }
-function renderActivity(){const rows=activity.slice().reverse().slice(0,75);$('activityTable').innerHTML=rows.length?'<table><thead><tr><th>Survey Day</th><th>Time</th><th>Surveyor</th><th>Type</th><th>Airline/Window</th><th>Airport</th></tr></thead><tbody>'+rows.map(a=>'<tr><td>'+escapeHtml(a.dayKey||'Legacy')+'</td><td>'+escapeHtml(a.time)+'</td><td>'+escapeHtml(a.surveyor)+'</td><td>'+escapeHtml(a.aboveGoal?a.type+' Above Goal':a.type)+'</td><td>'+escapeHtml(a.context)+'</td><td>'+escapeHtml(a.city)+'</td></tr>').join('')+'</tbody></table>':'<div class="muted">No activity yet.</div>'}
-
-function resetSurveyDay(){
-  ensureCurrentDay();
-  const stamp=currentDayKey+'-archived-'+Date.now();
-  activity=activity.map(a=>a.dayKey===currentDayKey?{...a,dayKey:stamp}:a);
-  currentDayKey=todayKey();
-  saveAll();
-  renderUserProgress();
-  renderManager();
-  alert("Survey day reset. Today's progress counters are back to zero. Workbook counts were not restored.");
+async function loadAssignmentsForDate(date){
+  assignmentsForDate=await loadAssignmentsForWeek(date,date);
+  return assignmentsForDate;
 }
 
-function exportCsv(){const header=['SurveyDay','Time','Surveyor','SurveyType','Context','Code','City','Airport','Traffic','AboveGoal'];const rows=activity.map(a=>[a.dayKey||'Legacy',a.time,a.surveyor,a.type,a.context,a.code,a.city,a.airport,a.traffic,a.aboveGoal?'Yes':'No']);const csv=[header].concat(rows).map(row=>row.map(v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"').join(',')).join('\n');const blob=new Blob([csv],{type:'text/csv'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='surveyops_activity.csv';a.click();URL.revokeObjectURL(url)}
+function assignmentDetailValue(assignment,type){
+  const detail=(assignment?.assignment_details || []).find(item=>
+    String(item.survey_type || '').toLowerCase()===type.toLowerCase()
+  );
+
+  return Number(detail?.required_count || 0);
+}
+
+function assignmentFocusAirlineId(assignment){
+  const detail=(assignment?.assignment_details || []).find(item=>
+    item.focus_airline_id
+  );
+
+  return detail?.focus_airline_id || '';
+}
+
+function assignmentAirlineOptions(selectedId){
+  const entries=airlineStatusEntries(
+    assignmentAirlines.map(airline=>({
+      id:airline.id,
+      code:airline.code || '',
+      name:airline.name
+    }))
+  );
+
+  return airlineStatusOptions(
+    entries,
+    selectedId,
+    {includeBlank:true}
+  );
+}
+
+function dailyAssignmentSummary(date){
+  const assigned={
+    Departure:0,
+    Commercial:0,
+    Arrival:0
+  };
+
+  assignmentsForDate.forEach(assignment=>{
+    (assignment.assignment_details || []).forEach(detail=>{
+      const type=String(detail.survey_type || '');
+      if(Object.prototype.hasOwnProperty.call(assigned,type)){
+        assigned[type]+=Number(detail.required_count || 0);
+      }
+    });
+  });
+
+  const completed={
+    Departure:0,
+    Commercial:0,
+    Arrival:0
+  };
+
+  countableActivity()
+    .filter(item=>item.dayKey===date)
+    .forEach(item=>{
+      const type=String(item.type || '');
+      if(Object.prototype.hasOwnProperty.call(completed,type)){
+        completed[type]+=1;
+      }
+    });
+
+  const assignedTotal=
+    assigned.Departure+assigned.Commercial+assigned.Arrival;
+  const completedTotal=
+    completed.Departure+completed.Commercial+completed.Arrival;
+
+  const summaryCard=(label,type)=>
+    '<div class="stat">'+
+      '<div class="muted">'+label+'</div>'+
+      '<div class="num">'+completed[type]+' / '+assigned[type]+'</div>'+
+      '<div class="muted">Recorded / Assigned</div>'+
+    '</div>';
+
+  return (
+    '<div class="panel" style="margin:14px 0">'+
+      '<h3>Daily Assignment Totals</h3>'+
+      '<div class="muted" style="margin-bottom:10px">'+
+        escapeHtml(date)+
+      '</div>'+
+      '<div class="stats">'+
+        summaryCard('Departures','Departure')+
+        summaryCard('Commercial','Commercial')+
+        summaryCard('Arrivals','Arrival')+
+        '<div class="stat">'+
+          '<div class="muted">All Surveys</div>'+
+          '<div class="num">'+completedTotal+' / '+assignedTotal+'</div>'+
+          '<div class="muted">Recorded / Assigned</div>'+
+        '</div>'+
+      '</div>'+
+    '</div>'
+  );
+}
+
+function localDateKey(date){
+  const year=date.getFullYear();
+  const month=String(date.getMonth()+1).padStart(2,'0');
+  const day=String(date.getDate()).padStart(2,'0');
+  return year+'-'+month+'-'+day;
+}
+
+function assignmentWeekRange(selectedDate){
+  const date=new Date(selectedDate+'T00:00:00');
+  const daysSinceSaturday=(date.getDay()+1)%7;
+  const start=new Date(date);
+  start.setDate(date.getDate()-daysSinceSaturday);
+
+  const end=new Date(start);
+  end.setDate(start.getDate()+6);
+
+  return {
+    start:localDateKey(start),
+    end:localDateKey(end)
+  };
+}
+
+function asqOfficialProgressSummary(){
+  const metric=(rows,prefix)=>rows.reduce(
+    (totals,row)=>{
+      const original=Number(row[prefix+'TargetOriginal'] || 0);
+      const modified=Number(row[prefix+'TargetModified'] || 0);
+
+      totals.target+=modified>0 ? modified : original;
+      totals.completed+=Number(row[prefix+'CompletedTargets'] || 0);
+      totals.remaining+=Number(row[prefix+'Remaining'] || 0);
+      totals.overQuota+=Number(row[prefix+'AboveGoal'] || 0);
+      return totals;
+    },
+    {target:0,completed:0,remaining:0,overQuota:0}
+  );
+
+  const departures=metric(depCom,'departure');
+  const commercial=metric(depCom,'commercial');
+  const arrival=metric(arrivals,'arrival');
+  const officialAvailable=
+    departures.target>0 ||
+    commercial.target>0 ||
+    arrival.target>0;
+
+  if(!officialAvailable){
+    return (
+      '<div class="panel" style="margin:14px 0">'+
+        '<h3>ASQ Official Progress</h3>'+
+        '<div class="muted">'+
+          'Publish the latest ASQ workbook to load official target, completed, remaining, and over-quota totals.'+
+        '</div>'+
+      '</div>'
+    );
+  }
+
+  const progressCard=(label,totals)=>{
+    const percent=totals.target
+      ? Math.min(100,Math.round((totals.completed/totals.target)*100))
+      : 0;
+
+    return (
+      '<div class="stat">'+
+        '<div class="muted">'+label+'</div>'+
+        '<div class="num">'+totals.completed+' / '+totals.target+'</div>'+
+        '<div class="muted">Completed Toward Target / Target</div>'+
+        '<div class="muted">'+percent+'% credited toward target</div>'+
+        '<div class="muted">Still Required: '+totals.remaining+'</div>'+
+        '<div class="muted">Additional Over-Quota: '+totals.overQuota+'</div>'+
+        '<div class="muted"><strong>Total Collected: '+
+          (totals.completed+totals.overQuota)+
+        '</strong></div>'+
+      '</div>'
+    );
+  };
+
+  return (
+    '<div class="panel" style="margin:14px 0">'+
+      '<h3>ASQ Official Progress</h3>'+
+      '<div class="muted" style="margin-bottom:10px">'+
+        'Source of truth: most recently published ASQ Excel workbook'+
+      '</div>'+
+      '<div class="stats">'+
+        progressCard('Departures',departures)+
+        progressCard('Commercial',commercial)+
+        progressCard('Arrivals',arrival)+
+      '</div>'+
+    '</div>'
+  );
+}
+
+function weeklyAssignmentSummary(startDate,endDate){
+  const assigned={
+    Departure:0,
+    Commercial:0,
+    Arrival:0
+  };
+
+  assignmentsForSummaryWeek.forEach(assignment=>{
+    (assignment.assignment_details || []).forEach(detail=>{
+      const type=String(detail.survey_type || '');
+      if(Object.prototype.hasOwnProperty.call(assigned,type)){
+        assigned[type]+=Number(detail.required_count || 0);
+      }
+    });
+  });
+
+  const completed={
+    Departure:0,
+    Commercial:0,
+    Arrival:0
+  };
+
+  countableActivity()
+    .filter(item=>
+      item.dayKey>=startDate &&
+      item.dayKey<=endDate
+    )
+    .forEach(item=>{
+      const type=String(item.type || '');
+      if(Object.prototype.hasOwnProperty.call(completed,type)){
+        completed[type]+=1;
+      }
+    });
+
+  const assignedTotal=
+    assigned.Departure+assigned.Commercial+assigned.Arrival;
+  const completedTotal=
+    completed.Departure+completed.Commercial+completed.Arrival;
+
+  const summaryCard=(label,type)=>
+    '<div class="stat">'+
+      '<div class="muted">'+label+'</div>'+
+      '<div class="num">'+completed[type]+' / '+assigned[type]+'</div>'+
+      '<div class="muted">Recorded / Assigned</div>'+
+    '</div>';
+
+  return (
+    '<div class="panel" style="margin:14px 0">'+
+      '<h3>Weekly Assignment Totals</h3>'+
+      '<div class="muted" style="margin-bottom:10px">'+
+        escapeHtml(startDate)+' through '+escapeHtml(endDate)+
+      '</div>'+
+      '<div class="stats">'+
+        summaryCard('Departures','Departure')+
+        summaryCard('Commercial','Commercial')+
+        summaryCard('Arrivals','Arrival')+
+        '<div class="stat">'+
+          '<div class="muted">All Surveys</div>'+
+          '<div class="num">'+completedTotal+' / '+assignedTotal+'</div>'+
+          '<div class="muted">Recorded / Assigned</div>'+
+        '</div>'+
+      '</div>'+
+    '</div>'
+  );
+}
+
+function weekDates(startDate){
+  const start=new Date(startDate+'T00:00:00');
+
+  return Array.from({length:7},(_,index)=>{
+    const date=new Date(start);
+    date.setDate(start.getDate()+index);
+    return localDateKey(date);
+  });
+}
+
+function scheduleForWeekday(schedule,weekday){
+  return schedule.find(item=>{
+    const savedDay=Number(item.weekday);
+    return savedDay===weekday || (weekday===0 && savedDay===7);
+  });
+}
+
+function assignmentCounts(assignment){
+  const counts={Departure:0,Commercial:0,Arrival:0};
+
+  (assignment?.assignment_details || []).forEach(detail=>{
+    const type=String(detail.survey_type || '');
+    if(Object.prototype.hasOwnProperty.call(counts,type)){
+      counts[type]=Number(detail.required_count || 0);
+    }
+  });
+
+  return counts;
+}
+
+function weeklyAssignmentGrid(startDate){
+  const dates=weekDates(startDate);
+  const dayNames=['Sat','Sun','Mon','Tue','Wed','Thu','Fri'];
+  const activeEmployees=employees.filter(
+    employee=>employee.active !== false
+  );
+  const activeEmployeeIds=new Set(
+    activeEmployees.map(employee=>employee.id)
+  );
+  const dailyTotals=dates.map(date=>{
+    const totals={Departure:0,Commercial:0,Arrival:0};
+
+    assignmentsForSummaryWeek
+      .filter(assignment=>
+        assignment.assignment_date===date &&
+        activeEmployeeIds.has(assignment.employee_id) &&
+        (()=>{
+          const weekday=new Date(date+'T00:00:00').getDay();
+          const schedule=
+            schedulesByEmployee.get(assignment.employee_id) || [];
+          const scheduleDay=scheduleForWeekday(schedule,weekday);
+          return !scheduleDay || scheduleDay.working!==false;
+        })()
+      )
+      .forEach(assignment=>{
+        const counts=assignmentCounts(assignment);
+        totals.Departure+=counts.Departure;
+        totals.Commercial+=counts.Commercial;
+        totals.Arrival+=counts.Arrival;
+      });
+
+    return totals;
+  });
+  const weekTotals=dailyTotals.reduce(
+    (totals,day)=>{
+      totals.Departure+=day.Departure;
+      totals.Commercial+=day.Commercial;
+      totals.Arrival+=day.Arrival;
+      return totals;
+    },
+    {Departure:0,Commercial:0,Arrival:0}
+  );
+  const weekTotal=
+    weekTotals.Departure+
+    weekTotals.Commercial+
+    weekTotals.Arrival;
+
+  const rows=activeEmployees.map(employee=>{
+    const schedule=schedulesByEmployee.get(employee.id) || [];
+    const shift=shifts.find(item=>item.id===employee.shift_id);
+    const totals={Departure:0,Commercial:0,Arrival:0};
+    const offDays=[];
+
+    const dayCells=dates.map((date,index)=>{
+      const weekday=new Date(date+'T00:00:00').getDay();
+      const scheduleDay=scheduleForWeekday(schedule,weekday);
+
+      if(scheduleDay && scheduleDay.working===false){
+        offDays.push(dayNames[index]);
+        return (
+          '<td style="background:#303740;color:#d7dde5;text-align:center">'+
+            '<strong>OFF</strong>'+
+          '</td>'
+        );
+      }
+
+      const assignment=assignmentsForSummaryWeek.find(item=>
+        item.employee_id===employee.id &&
+        item.assignment_date===date
+      );
+      const counts=assignmentCounts(assignment);
+
+      totals.Departure+=counts.Departure;
+      totals.Commercial+=counts.Commercial;
+      totals.Arrival+=counts.Arrival;
+
+      const parts=[];
+      if(counts.Departure)parts.push('D '+counts.Departure);
+      if(counts.Commercial)parts.push('C '+counts.Commercial);
+      if(counts.Arrival)parts.push('A '+counts.Arrival);
+
+      return (
+        '<td style="text-align:center;white-space:nowrap;cursor:pointer"'+
+          ' title="Click to edit assignment"'+
+          ' data-grid-assignment-employee="'+escapeHtml(employee.id)+'"'+
+          ' data-grid-assignment-date="'+escapeHtml(date)+'">'+
+          (parts.length
+            ? parts.join('<br>')
+            : '<button class="small-btn" type="button" style="padding:5px 8px">+ Assign</button>')+
+        '</td>'
+      );
+    }).join('');
+
+    const total=
+      totals.Departure+totals.Commercial+totals.Arrival;
+
+    return (
+      '<tr>'+
+        '<td><strong>'+escapeHtml(employee.name)+'</strong></td>'+
+        '<td>'+escapeHtml(shift?.name || 'Unassigned')+'</td>'+
+        '<td>'+escapeHtml(offDays.join(', ') || '—')+'</td>'+
+        dayCells+
+        '<td>'+totals.Arrival+'</td>'+
+        '<td>'+totals.Commercial+'</td>'+
+        '<td>'+totals.Departure+'</td>'+
+        '<td><strong>'+total+'</strong></td>'+
+      '</tr>'
+    );
+  }).join('');
+
+  return (
+    '<div class="panel" style="margin:14px 0;overflow-x:auto">'+
+      '<h3>Weekly Assignment Grid</h3>'+
+      '<table>'+
+        '<thead><tr>'+
+          '<th>Surveyor</th>'+
+          '<th>Shift</th>'+
+          '<th>Off Days</th>'+
+          dates.map((date,index)=>
+            '<th>'+dayNames[index]+'<br>'+
+              '<span class="muted">'+escapeHtml(date.slice(5))+'</span>'+
+            '</th>'
+          ).join('')+
+          '<th>Arr</th>'+
+          '<th>Com</th>'+
+          '<th>Dep</th>'+
+          '<th>Total</th>'+
+        '</tr></thead>'+
+        '<tbody>'+
+          (rows || '<tr><td colspan="14">No surveyors found.</td></tr>')+
+        '</tbody>'+
+        '<tfoot><tr>'+
+          '<th colspan="3">Daily Totals</th>'+
+          dailyTotals.map(totals=>{
+            const total=
+              totals.Departure+totals.Commercial+totals.Arrival;
+
+            return (
+              '<th style="text-align:center;white-space:nowrap">'+
+                'D '+totals.Departure+'<br>'+
+                'C '+totals.Commercial+'<br>'+
+                'A '+totals.Arrival+'<br>'+
+                '<strong>Total '+total+'</strong>'+
+              '</th>'
+            );
+          }).join('')+
+          '<th>'+weekTotals.Arrival+'</th>'+
+          '<th>'+weekTotals.Commercial+'</th>'+
+          '<th>'+weekTotals.Departure+'</th>'+
+          '<th>'+weekTotal+'</th>'+
+        '</tr></tfoot>'+
+      '</table>'+
+    '</div>'
+  );
+}
+
+function managerMessageStatus(message){
+  const today=todayKey();
+
+  if(!message.active)return 'Inactive';
+  if(message.starts_on>today)return 'Upcoming';
+  if(message.expires_on && message.expires_on<today)return 'Expired';
+  return 'Active';
+}
+
+function managerMessageAudienceLabel(message){
+  if(message.audience_type==='all')return 'All Surveyors';
+  if(message.audience_type==='am')return 'All AM';
+  if(message.audience_type==='pm')return 'All PM';
+
+  const ids=message.recipient_employee_ids || [];
+  const names=ids.map(id=>
+    employees.find(employee=>employee.id===id)?.name
+  ).filter(Boolean);
+
+  return names.length ? names.join(', ') : 'Selected Surveyors';
+}
+
+function managerMessageLauncher(){
+  const activeCount=managerMessages.filter(
+    message=>managerMessageStatus(message)==='Active'
+  ).length;
+
+  return (
+    '<div class="panel" style="margin:14px 0;display:flex;'+
+      'align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">'+
+      '<div><h3 style="margin:0">Manager Messages</h3>'+ 
+        '<div class="muted" style="margin-top:4px">'+
+          activeCount+' active message'+(activeCount===1 ? '' : 's')+
+        '</div></div>'+ 
+      '<button class="small-btn green" type="button" data-manager-messages-open>'+ 
+        'Messages ('+activeCount+')'+
+      '</button>'+ 
+    '</div>'
+  );
+}
+
+function closeManagerMessageCenter(){
+  document.getElementById('managerMessageCenterBackdrop')?.remove();
+}
+
+function openManagerMessageCenter(editMessageId=''){
+  closeManagerMessageCenter();
+
+  const editing=managerMessages.find(message=>message.id===editMessageId);
+  const audience=editing?.audience_type || 'all';
+  const selectedIds=new Set(editing?.recipient_employee_ids || []);
+  const activeEmployees=employees.filter(
+    employee=>employee.active !== false
+  );
+  const audienceButtons=[
+    ['all','All Surveyors'],
+    ['am','All AM'],
+    ['pm','All PM'],
+    ['individual','Individual Names']
+  ];
+  const messageRows=managerMessages.map(message=>{
+    const status=managerMessageStatus(message);
+    const canDeactivate=message.active;
+
+    return (
+      '<div style="border-top:1px solid #e2e7ee;padding:10px 0">'+
+        '<div style="display:flex;justify-content:space-between;gap:10px;align-items:start">'+
+          '<div><strong>'+escapeHtml(message.title)+'</strong>'+ 
+            '<div class="muted" style="font-size:12px;margin-top:2px">'+
+              escapeHtml(managerMessageAudienceLabel(message))+' • '+
+              escapeHtml(status)+
+            '</div></div>'+ 
+          '<div style="display:flex;gap:5px;flex-wrap:wrap;justify-content:end">'+
+            '<button class="small-btn" type="button" data-message-edit="'+escapeHtml(message.id)+'" style="padding:4px 7px">Edit</button>'+ 
+            (canDeactivate
+              ? '<button class="small-btn" type="button" data-message-deactivate="'+escapeHtml(message.id)+'" style="padding:4px 7px">Deactivate</button>'
+              : '')+
+          '</div>'+ 
+        '</div>'+ 
+        '<div style="margin-top:6px;white-space:pre-wrap">'+escapeHtml(message.message_body)+'</div>'+ 
+        '<div class="muted" style="font-size:11px;margin-top:6px">'+
+          'Starts '+escapeHtml(message.starts_on)+
+          (message.expires_on ? ' • Expires '+escapeHtml(message.expires_on) : ' • No expiration')+
+        '</div>'+ 
+      '</div>'
+    );
+  }).join('');
+
+  const backdrop=document.createElement('div');
+  backdrop.id='managerMessageCenterBackdrop';
+  backdrop.style.cssText=
+    'position:fixed;inset:0;z-index:1100;background:rgba(15,23,42,.28);'+
+    'display:flex;align-items:center;justify-content:center;padding:12px';
+  backdrop.innerHTML=
+    '<div data-message-center style="width:640px;max-width:100%;max-height:calc(100vh - 24px);'+
+      'overflow-y:auto;background:#fff;border:1px solid #cfd8e3;border-radius:14px;'+
+      'box-shadow:0 16px 42px rgba(15,23,42,.3);padding:16px">'+
+      '<div style="display:flex;justify-content:space-between;gap:12px;align-items:start">'+
+        '<div><h3 style="margin:0">Message Center</h3>'+ 
+          '<div class="muted" style="margin-top:3px">'+
+            (editing ? 'Edit manager message' : 'Create a manager message')+
+          '</div></div>'+ 
+        '<button class="small-btn" type="button" data-message-close style="padding:3px 8px">×</button>'+ 
+      '</div>'+ 
+      '<label style="display:block;margin-top:14px">Title</label>'+ 
+      '<input class="input" data-message-title maxlength="100" value="'+escapeHtml(editing?.title || '')+'" style="width:100%;margin-top:4px">'+ 
+      '<label style="display:block;margin-top:10px">Message</label>'+ 
+      '<textarea class="input" data-message-body rows="4" maxlength="2000" style="width:100%;margin-top:4px;resize:vertical">'+
+        escapeHtml(editing?.message_body || '')+
+      '</textarea>'+ 
+      '<div style="margin-top:10px">Recipients</div>'+ 
+      '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px">'+
+        audienceButtons.map(([value,label])=>
+          '<button class="small-btn'+(value===audience ? ' green' : '')+'" type="button" data-message-audience="'+value+'">'+label+'</button>'
+        ).join('')+
+      '</div>'+ 
+      '<div data-message-individuals style="margin-top:8px;'+(audience==='individual' ? '' : 'display:none')+'">'+
+        '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px">'+
+          activeEmployees.map(employee=>
+            '<label style="display:flex;gap:6px;align-items:center">'+
+              '<input type="checkbox" value="'+escapeHtml(employee.id)+'" data-message-recipient'+
+                (selectedIds.has(employee.id) ? ' checked' : '')+'>'+ 
+              escapeHtml(employee.name)+
+            '</label>'
+          ).join('')+
+        '</div>'+ 
+      '</div>'+ 
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">'+
+        '<label>Start Date<input class="input" type="date" data-message-start value="'+escapeHtml(editing?.starts_on || todayKey())+'" style="width:100%;margin-top:4px"></label>'+ 
+        '<label>Expiration Date<input class="input" type="date" data-message-expiration value="'+escapeHtml(editing?.expires_on || '')+'" style="width:100%;margin-top:4px"></label>'+ 
+      '</div>'+ 
+      '<div style="display:flex;gap:7px;margin-top:12px">'+
+        '<button class="small-btn green" type="button" data-message-save>'+ 
+          (editing ? 'Save Changes' : 'Publish Message')+
+        '</button>'+ 
+        '<button class="small-btn" type="button" data-message-close>Cancel</button>'+ 
+      '</div>'+ 
+      '<div class="muted" data-message-status style="margin-top:7px"></div>'+ 
+      '<h3 style="margin:18px 0 0">Message History</h3>'+ 
+      (messageRows || '<div class="muted" style="margin-top:8px">No messages have been created.</div>')+
+    '</div>';
+
+  document.body.appendChild(backdrop);
+  const center=backdrop.querySelector('[data-message-center]');
+  center.dataset.messageAudience=audience;
+
+  const setAudience=value=>{
+    center.dataset.messageAudience=value;
+    center.querySelectorAll('[data-message-audience]').forEach(button=>
+      button.classList.toggle('green',button.dataset.messageAudience===value)
+    );
+    center.querySelector('[data-message-individuals]').style.display=
+      value==='individual' ? 'block' : 'none';
+  };
+
+  center.querySelectorAll('[data-message-audience]').forEach(button=>
+    button.addEventListener('click',()=>setAudience(button.dataset.messageAudience))
+  );
+  center.querySelectorAll('[data-message-close]').forEach(button=>
+    button.addEventListener('click',closeManagerMessageCenter)
+  );
+  backdrop.addEventListener('click',event=>{
+    if(event.target===backdrop)closeManagerMessageCenter();
+  });
+  center.querySelectorAll('[data-message-edit]').forEach(button=>
+    button.addEventListener('click',()=>openManagerMessageCenter(button.dataset.messageEdit))
+  );
+  center.querySelectorAll('[data-message-deactivate]').forEach(button=>
+    button.addEventListener('click',async()=>{
+      if(!confirm('Deactivate this message? Its history will be preserved.'))return;
+      button.disabled=true;
+      button.textContent='Deactivating...';
+
+      try{
+        await deactivateManagerMessage(button.dataset.messageDeactivate);
+        closeManagerMessageCenter();
+        await renderAssignments({preserveContent:true});
+      }catch(error){
+        console.error('Message deactivation failed:',error);
+        button.disabled=false;
+        button.textContent='Deactivate';
+        alert('The message could not be deactivated. '+(error.message || ''));
+      }
+    })
+  );
+  center.querySelector('[data-message-save]').addEventListener('click',async event=>{
+    const button=event.currentTarget;
+    const title=center.querySelector('[data-message-title]').value.trim();
+    const messageBody=center.querySelector('[data-message-body]').value.trim();
+    const audienceType=center.dataset.messageAudience;
+    const recipientEmployeeIds=Array.from(
+      center.querySelectorAll('[data-message-recipient]:checked')
+    ).map(input=>input.value);
+    const startsOn=center.querySelector('[data-message-start]').value;
+    const expiresOn=center.querySelector('[data-message-expiration]').value || null;
+    const status=center.querySelector('[data-message-status]');
+
+    if(!title || !messageBody || !startsOn){
+      status.textContent='Enter a title, message, and start date.';
+      return;
+    }
+    if(audienceType==='individual' && !recipientEmployeeIds.length){
+      status.textContent='Select at least one surveyor.';
+      return;
+    }
+    if(expiresOn && expiresOn<startsOn){
+      status.textContent='Expiration date cannot be before the start date.';
+      return;
+    }
+
+    button.disabled=true;
+    button.textContent='Saving...';
+
+    try{
+      await saveManagerMessage({
+        id:editing?.id,
+        title,
+        messageBody,
+        audienceType,
+        recipientEmployeeIds,
+        startsOn,
+        expiresOn,
+        active:editing?.active !== false
+      });
+      closeManagerMessageCenter();
+      await renderAssignments({preserveContent:true});
+    }catch(error){
+      console.error('Manager message save failed:',error);
+      status.textContent='Save failed. '+(error.message || '');
+      button.disabled=false;
+      button.textContent=editing ? 'Save Changes' : 'Publish Message';
+    }
+  });
+
+  center.querySelector('[data-message-title]')?.focus();
+}
+
+async function renderAssignments({preserveContent=false}={}){
+  const container=$('assignmentCards');
+  const dateInput=$('assignmentDate');
+
+  if(!container || !dateInput)return;
+
+  closeGridAssignmentPopover();
+
+  if(!dateInput.value){
+    dateInput.value=todayKey();
+  }
+
+  if(!preserveContent){
+    container.innerHTML=
+      '<div class="muted">Loading assignments...</div>';
+  }
+
+  try{
+    await loadAssignmentsForDate(dateInput.value);
+    const week=assignmentWeekRange(dateInput.value);
+    assignmentsForSummaryWeek=await loadAssignmentsForWeek(
+      week.start,
+      week.end
+    );
+    managerMessages=await loadManagerMessages();
+    const scheduleEntries=await Promise.all(
+      employees
+        .filter(employee=>employee.active !== false)
+        .map(async employee=>[
+          employee.id,
+          await loadEmployeeSchedule(employee.id)
+        ])
+    );
+    schedulesByEmployee=new Map(scheduleEntries);
+  }catch(error){
+    console.error('Assignment load failed:',error);
+    container.innerHTML=
+      '<div class="muted">Assignments could not be loaded.</div>';
+    return;
+  }
+
+  if(!employees.length){
+    container.innerHTML=
+      '<div class="muted">No surveyors have been added.</div>';
+    return;
+  }
+
+  const amEmployees=[];
+  const pmEmployees=[];
+  const unassigned=[];
+
+  employees
+    .filter(employee=>employee.active !== false)
+    .forEach(employee=>{
+      const shift=shifts.find(s=>s.id===employee.shift_id);
+
+      if(!shift){
+        unassigned.push(employee);
+        return;
+      }
+
+      const group=String(
+        shift.balance_group || shift.name || ''
+      ).toUpperCase();
+
+      if(group.includes('AM')){
+        amEmployees.push(employee);
+      }else if(group.includes('PM')){
+        pmEmployees.push(employee);
+      }else{
+        unassigned.push(employee);
+      }
+    });
+
+  const week=assignmentWeekRange(dateInput.value);
+
+  container.innerHTML=
+    managerMessageLauncher()+
+    asqOfficialProgressSummary()+
+    dailyAssignmentSummary(dateInput.value)+
+    weeklyAssignmentSummary(week.start,week.end)+
+    weeklyAssignmentGrid(week.start)+
+    renderAssignmentGroup('AM SHIFT',amEmployees)+
+    renderAssignmentGroup('PM SHIFT',pmEmployees)+
+    renderAssignmentGroup('UNASSIGNED',unassigned);
+
+  document
+    .querySelectorAll('[data-assignment-save]')
+    .forEach(button=>{
+      button.addEventListener('click',()=>saveAssignmentCard(button));
+    });
+
+  document
+    .querySelectorAll('[data-grid-assignment-employee]')
+    .forEach(cell=>{
+      cell.addEventListener('click',()=>openGridAssignmentEditor(cell));
+    });
+
+  document
+    .querySelector('[data-manager-messages-open]')
+    ?.addEventListener('click',()=>openManagerMessageCenter());
+}
+
+function openGridAssignmentEditor(cell){
+  closeGridAssignmentPopover();
+
+  const employeeId=cell.dataset.gridAssignmentEmployee;
+  const assignmentDate=cell.dataset.gridAssignmentDate;
+  const employee=employees.find(item=>item.id===employeeId);
+  const assignment=assignmentsForSummaryWeek.find(item=>
+    item.employee_id===employeeId &&
+    item.assignment_date===assignmentDate
+  );
+  const goal=type=>assignmentDetailValue(assignment,type);
+  const focusAirlineId=assignmentFocusAirlineId(assignment);
+  const managerNotes=assignment?.manager_notes || '';
+
+  const backdrop=document.createElement('div');
+  backdrop.id='gridAssignmentPopoverBackdrop';
+  backdrop.style.cssText=
+    'position:fixed;inset:0;z-index:1000;background:transparent';
+  backdrop.innerHTML=
+    '<div data-grid-popover style="position:fixed;width:300px;max-width:calc(100vw - 24px);'+
+      'background:#fff;border:1px solid #cfd8e3;border-radius:12px;'+
+      'box-shadow:0 12px 32px rgba(15,23,42,.24);padding:14px;text-align:left;'+
+      'max-height:calc(100vh - 24px);overflow-y:auto">'+
+      '<div style="display:flex;justify-content:space-between;gap:10px;align-items:start">'+
+        '<div><strong>'+escapeHtml(employee?.name || 'Surveyor')+'</strong>'+ 
+          '<div class="muted" style="font-size:12px;margin-top:2px">'+escapeHtml(assignmentDate)+'</div>'+ 
+        '</div>'+ 
+        '<button class="small-btn" type="button" data-grid-cancel style="padding:3px 7px">×</button>'+ 
+      '</div>'+ 
+      '<div style="display:grid;grid-template-columns:1fr auto;gap:8px 10px;align-items:center;margin-top:12px">'+
+        '<label for="gridDepartureGoal">Departures</label>'+ 
+        '<input id="gridDepartureGoal" class="input" type="number" min="0" max="99" value="'+goal('Departure')+'" data-grid-goal="departure" style="width:64px;padding:6px">'+
+        '<label for="gridCommercialGoal">Commercial</label>'+ 
+        '<input id="gridCommercialGoal" class="input" type="number" min="0" max="99" value="'+goal('Commercial')+'" data-grid-goal="commercial" style="width:64px;padding:6px">'+
+        '<label for="gridArrivalGoal">Arrivals</label>'+ 
+        '<input id="gridArrivalGoal" class="input" type="number" min="0" max="99" value="'+goal('Arrival')+'" data-grid-goal="arrival" style="width:64px;padding:6px">'+
+      '</div>'+ 
+      '<label style="display:block;margin-top:10px">Focus Airline</label>'+ 
+      '<select class="input" data-grid-airline style="width:100%;padding:7px;margin-top:4px">'+
+        assignmentAirlineOptions(focusAirlineId)+
+      '</select>'+ 
+      '<label style="display:block;margin-top:10px">Manager Comments</label>'+ 
+      '<textarea class="input" data-grid-manager-notes rows="3" maxlength="500"'+
+        ' placeholder="Optional instructions for this surveyor"'+
+        ' style="width:100%;padding:7px;margin-top:4px;resize:vertical">'+
+        escapeHtml(managerNotes)+
+      '</textarea>'+ 
+      '<div style="display:flex;gap:7px;margin-top:12px">'+
+        '<button class="small-btn green" type="button" data-grid-save style="padding:7px 11px">Save</button>'+ 
+        '<button class="small-btn" type="button" data-grid-cancel style="padding:7px 11px">Cancel</button>'+ 
+      '</div>'+ 
+      '<span class="muted" data-grid-status style="display:block;font-size:11px;margin-top:6px"></span>'+ 
+    '</div>';
+
+  document.body.appendChild(backdrop);
+
+  const popover=backdrop.querySelector('[data-grid-popover]');
+  popover.dataset.gridAssignmentEmployee=employeeId;
+  popover.dataset.gridAssignmentDate=assignmentDate;
+
+  const cellRect=cell.getBoundingClientRect();
+  const popoverWidth=Math.min(300,window.innerWidth-24);
+  const left=Math.max(
+    12,
+    Math.min(cellRect.left,window.innerWidth-popoverWidth-12)
+  );
+  const estimatedHeight=430;
+  const preferredTop=cellRect.bottom+6;
+  const top=preferredTop+estimatedHeight<=window.innerHeight
+    ? preferredTop
+    : Math.max(12,cellRect.top-estimatedHeight-6);
+
+  popover.style.left=left+'px';
+  popover.style.top=top+'px';
+
+  backdrop.addEventListener('click',event=>{
+    if(event.target===backdrop)closeGridAssignmentPopover();
+  });
+  popover
+    .querySelectorAll('[data-grid-cancel]')
+    .forEach(button=>button.addEventListener(
+      'click',
+      closeGridAssignmentPopover
+    ));
+
+  const save=popover.querySelector('[data-grid-save]');
+  save.addEventListener('click',()=>saveGridAssignment(popover,save));
+
+  popover.querySelector('[data-grid-goal="departure"]')?.focus();
+}
+
+function closeGridAssignmentPopover(){
+  document.getElementById('gridAssignmentPopoverBackdrop')?.remove();
+}
+
+async function saveGridAssignment(popover,button){
+  const employeeId=popover.dataset.gridAssignmentEmployee;
+  const assignmentDate=popover.dataset.gridAssignmentDate;
+  const getGoal=type=>Math.max(
+    0,
+    Math.min(
+      99,
+      Number(popover.querySelector('[data-grid-goal="'+type+'"]')?.value || 0)
+    )
+  );
+  const focusAirlineId=
+    popover.querySelector('[data-grid-airline]')?.value || null;
+  const managerNotes=
+    popover.querySelector('[data-grid-manager-notes]')?.value || '';
+  const status=popover.querySelector('[data-grid-status]');
+
+  button.disabled=true;
+  button.textContent='Saving...';
+
+  try{
+    await saveDailyAssignment({
+      employeeId,
+      assignmentDate,
+      status:'Published',
+      managerNotes,
+      details:[
+        {
+          survey_type:'Departure',
+          required_count:getGoal('departure'),
+          focus_airline_id:focusAirlineId
+        },
+        {
+          survey_type:'Commercial',
+          required_count:getGoal('commercial'),
+          focus_airline_id:focusAirlineId
+        },
+        {
+          survey_type:'Arrival',
+          required_count:getGoal('arrival')
+        }
+      ]
+    });
+
+    await renderAssignments({preserveContent:true});
+  }catch(error){
+    console.error('Weekly grid assignment save failed:',error);
+    if(status)status.textContent='Save failed';
+    button.disabled=false;
+    button.textContent='Save';
+    alert(
+      'The assignment could not be saved. '+
+      (error.message || '')
+    );
+  }
+}
+
+function renderAssignmentGroup(title,list){
+  return `
+    <h3 style="margin-top:20px">
+      ${escapeHtml(title)}
+    </h3>
+
+    ${
+      list.length
+        ? list.map(employee=>{
+            const shift=shifts.find(item=>item.id===employee.shift_id);
+            const assignment=assignmentsForDate.find(
+              item=>item.employee_id===employee.id
+            );
+
+            const departureGoal=assignmentDetailValue(
+              assignment,
+              'Departure'
+            );
+            const commercialGoal=assignmentDetailValue(
+              assignment,
+              'Commercial'
+            );
+            const arrivalGoal=assignmentDetailValue(
+              assignment,
+              'Arrival'
+            );
+            const focusAirlineId=assignmentFocusAirlineId(assignment);
+
+            return `
+              <div class="card" style="margin-bottom:14px">
+                <strong>${escapeHtml(employee.name)}</strong>
+
+                <div class="muted" style="margin-top:4px;font-size:12px">
+                  ${escapeHtml(shift?.name || 'Shift not assigned')}
+                </div>
+
+                <div class="row" style="margin-top:12px;align-items:center">
+                  <label style="width:120px">Departures</label>
+                  <input class="input" type="number" min="0"
+                    value="${departureGoal}"
+                    data-assignment-type="departure"
+                    data-assignment-employee="${employee.id}">
+                </div>
+
+                <div class="row" style="margin-top:8px;align-items:center">
+                  <label style="width:120px">Commercial</label>
+                  <input class="input" type="number" min="0"
+                    value="${commercialGoal}"
+                    data-assignment-type="commercial"
+                    data-assignment-employee="${employee.id}">
+                </div>
+
+                <div class="row" style="margin-top:8px;align-items:center">
+                  <label style="width:120px">Arrivals</label>
+                  <input class="input" type="number" min="0"
+                    value="${arrivalGoal}"
+                    data-assignment-type="arrival"
+                    data-assignment-employee="${employee.id}">
+                </div>
+
+                <div class="row" style="margin-top:8px;align-items:center">
+                  <label style="width:120px">Focus Airline</label>
+                  <select class="input"
+                    data-assignment-airline="${employee.id}">
+                    ${assignmentAirlineOptions(focusAirlineId)}
+                  </select>
+                </div>
+
+                <button
+                  class="small-btn green"
+                  style="margin-top:12px"
+                  data-assignment-save="${employee.id}">
+                  Save Assignment
+                </button>
+
+                <span
+                  class="muted"
+                  style="margin-left:8px"
+                  data-assignment-status="${employee.id}">
+                  ${assignment ? 'Saved' : ''}
+                </span>
+              </div>
+            `;
+          }).join('')
+        : '<div class="muted">None</div>'
+    }
+  `;
+}
+
+async function saveAssignmentCard(button){
+  const employeeId=button.dataset.assignmentSave;
+  const assignmentDate=$('assignmentDate').value;
+  const existingAssignment=assignmentsForDate.find(
+    item=>item.employee_id===employeeId
+  );
+
+  if(!assignmentDate){
+    alert('Select an assignment date.');
+    return;
+  }
+
+  const getGoal=type=>{
+    const input=document.querySelector(
+      '[data-assignment-employee="'+employeeId+'"]'+
+      '[data-assignment-type="'+type+'"]'
+    );
+
+    return Math.max(0,Number(input?.value || 0));
+  };
+
+  const airlineInput=document.querySelector(
+    '[data-assignment-airline="'+employeeId+'"]'
+  );
+  const focusAirlineId=airlineInput?.value || null;
+
+  const originalText=button.textContent;
+  const status=document.querySelector(
+    '[data-assignment-status="'+employeeId+'"]'
+  );
+
+  button.disabled=true;
+  button.textContent='Saving...';
+
+  try{
+    await saveDailyAssignment({
+      employeeId,
+      assignmentDate,
+      status:'Published',
+      managerNotes:existingAssignment?.manager_notes || '',
+      details:[
+        {
+          survey_type:'Departure',
+          required_count:getGoal('departure'),
+          focus_airline_id:focusAirlineId
+        },
+        {
+          survey_type:'Commercial',
+          required_count:getGoal('commercial'),
+          focus_airline_id:focusAirlineId
+        },
+        {
+          survey_type:'Arrival',
+          required_count:getGoal('arrival')
+        }
+      ]
+    });
+
+    if(status)status.textContent='Saved';
+    await loadAssignmentsForDate(assignmentDate);
+  }catch(error){
+    console.error('Daily assignment save failed:',error);
+
+    if(status)status.textContent='Save failed';
+
+    alert(
+      'The assignment could not be saved. '+
+      (error.message || '')
+    );
+  }finally{
+    button.disabled=false;
+    button.textContent=originalText;
+  }
+}
+
+async function loadAgentAssignment(){
+  agentAssignment=null;
+
+  const employee=employees.find(
+    item=>item.name===currentSurveyor
+  );
+
+  if(!employee)return null;
+
+  const rows=await loadAssignmentsForWeek(
+    todayKey(),
+    todayKey()
+  );
+
+  agentAssignment=rows.find(
+    item=>item.employee_id===employee.id
+  ) || null;
+
+  return agentAssignment;
+}
+
+function applicableAgentMessages(){
+  const employee=employees.find(
+    item=>item.name===currentSurveyor
+  );
+
+  if(!employee)return [];
+
+  const shift=shifts.find(item=>item.id===employee.shift_id);
+  const group=String(
+    shift?.balance_group || shift?.name || employee.shifts?.balance_group || ''
+  ).toUpperCase();
+  const today=todayKey();
+
+  return managerMessages.filter(message=>{
+    if(!message.active)return false;
+    if(message.starts_on>today)return false;
+    if(message.expires_on && message.expires_on<today)return false;
+
+    if(message.audience_type==='all')return true;
+    if(message.audience_type==='am')return group.includes('AM');
+    if(message.audience_type==='pm')return group.includes('PM');
+    if(message.audience_type==='individual'){
+      return (message.recipient_employee_ids || []).includes(employee.id);
+    }
+
+    return false;
+  });
+}
+
+function renderAgentMessages(){
+  const workType=$('workType');
+  if(!workType)return;
+
+  let panel=$('agentMessageSummary');
+
+  if(!panel){
+    panel=document.createElement('div');
+    panel.id='agentMessageSummary';
+    panel.className='panel';
+    panel.style.marginBottom='14px';
+
+    const assignmentPanel=$('agentAssignmentSummary');
+    const grid=workType.querySelector('.worktype-grid');
+    workType.insertBefore(panel,assignmentPanel || grid || null);
+  }
+
+  const messages=applicableAgentMessages();
+
+  if(!currentSurveyor || !messages.length){
+    panel.innerHTML='';
+    panel.classList.add('hidden');
+    return;
+  }
+
+  panel.classList.remove('hidden');
+  panel.style.borderLeft='5px solid #2563eb';
+  panel.innerHTML=
+    '<h3 style="margin-top:0">Manager Messages</h3>'+ 
+    messages.map(message=>
+      '<div style="padding:10px 0;border-top:1px solid #e2e7ee">'+
+        '<strong>'+escapeHtml(message.title)+'</strong>'+ 
+        '<div style="margin-top:5px;white-space:pre-wrap">'+
+          escapeHtml(message.message_body)+
+        '</div>'+ 
+        '<div class="muted" style="font-size:11px;margin-top:6px">'+
+          'Effective '+escapeHtml(message.starts_on)+
+          (message.expires_on
+            ? ' through '+escapeHtml(message.expires_on)
+            : '')+
+        '</div>'+ 
+      '</div>'
+    ).join('');
+}
+
+function renderAgentAssignment(){
+  const workType=$('workType');
+  if(!workType)return;
+
+  renderAgentMessages();
+
+  let panel=$('agentAssignmentSummary');
+
+  if(!panel){
+    panel=document.createElement('div');
+    panel.id='agentAssignmentSummary';
+    panel.className='panel';
+    panel.style.marginBottom='14px';
+
+    const grid=workType.querySelector('.worktype-grid');
+    workType.insertBefore(panel,grid || null);
+  }
+
+  if(!currentSurveyor){
+    panel.innerHTML='';
+    panel.classList.add('hidden');
+    return;
+  }
+
+  panel.classList.remove('hidden');
+
+  if(!agentAssignment){
+    panel.innerHTML=
+      '<h3>Today&rsquo;s Assignment</h3>'+
+      '<div class="muted">No assignment has been published for today.</div>';
+    return;
+  }
+
+  const departureGoal=assignmentDetailValue(
+    agentAssignment,
+    'Departure'
+  );
+  const commercialGoal=assignmentDetailValue(
+    agentAssignment,
+    'Commercial'
+  );
+  const arrivalGoal=assignmentDetailValue(
+    agentAssignment,
+    'Arrival'
+  );
+
+  const completedDeparture=userTypeCount('Departure');
+  const completedCommercial=userTypeCount('Commercial');
+  const completedArrival=userTypeCount('Arrival');
+  const focusDetail=(agentAssignment.assignment_details || []).find(
+    item=>item.focus_airline_id
+  );
+  const focusAirline=focusDetail?.airlines;
+
+  panel.innerHTML=
+    '<h3>Today&rsquo;s Assignment</h3>'+
+    '<div class="stats">'+
+      '<div class="stat">'+
+        '<div class="muted">Departures</div>'+
+        '<div class="num">'+completedDeparture+' / '+departureGoal+'</div>'+
+      '</div>'+
+      '<div class="stat">'+
+        '<div class="muted">Commercial</div>'+
+        '<div class="num">'+completedCommercial+' / '+commercialGoal+'</div>'+
+      '</div>'+
+      '<div class="stat">'+
+        '<div class="muted">Arrivals</div>'+
+        '<div class="num">'+completedArrival+' / '+arrivalGoal+'</div>'+
+      '</div>'+
+    '</div>'+ 
+    (
+      focusAirline
+        ? '<div style="margin-top:10px"><strong>Focus Airline</strong>'+ 
+          '<div class="muted">'+escapeHtml(
+            (focusAirline.code ? focusAirline.code+' — ' : '')+
+            focusAirline.name
+          )+'</div></div>'
+        : ''
+    )+
+    (
+      agentAssignment.manager_notes
+        ? '<div style="margin-top:10px"><strong>Manager Notes</strong>'+
+          '<div class="muted" style="white-space:pre-wrap">'+
+            escapeHtml(agentAssignment.manager_notes)+
+          '</div></div>'
+        : ''
+    );
+}
+
+function exportCsv(){
+  const header=[
+    'AuditID','SurveyDay','Time','Surveyor','Action','Status',
+    'VoidsAuditID','SurveyType','Context','Code','City','Airport',
+    'Traffic','AboveGoal'
+  ];
+  const rows=activity.map(a=>[
+    a.auditId||'',
+    a.dayKey||'Legacy',
+    a.time,
+    a.surveyor,
+    a.action||'Recorded',
+    a.status||(a.voided?'Voided':'Active'),
+    a.voidsAuditId||'',
+    a.type,
+    a.context,
+    a.code,
+    a.city,
+    a.airport,
+    a.traffic,
+    a.aboveGoal?'Yes':'No'
+  ]);
+  const csv=[header].concat(rows)
+    .map(row=>row.map(value=>
+      '"'+String(value==null?'':value).replace(/"/g,'""')+'"'
+    ).join(','))
+    .join('\n');
+  const blob=new Blob([csv],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
+  const link=document.createElement('a');
+  link.href=url;
+  link.download='surveyops_audit_log.csv';
+  link.click();
+  URL.revokeObjectURL(url);
+}
 function renderWorkbookReview(result){
   const s=result.summary;
 
@@ -377,27 +2275,312 @@ renderWorkbookReview(result);
   }
 }
 
-function wire(){ensureCurrentDay();fillSelects();$('workbookInput').addEventListener('change',()=>{$('workbookImportStatus').textContent=$('workbookInput').files[0]?$('workbookInput').files[0].name+' selected. Click Review Workbook.':'No workbook selected.';$('workbookImportSummary').innerHTML=''});$('reviewWorkbookBtn').addEventListener('click',handleWorkbookReview);$('agentModeBtn').addEventListener('click',()=>show('agentLogin'));$('managerModeBtn').addEventListener('click',()=>show('managerLogin'));document.querySelectorAll('[data-go]').forEach(b=>b.addEventListener('click',()=>show(b.dataset.go)));$('startAgentBtn').addEventListener('click',()=>{currentSurveyor=$('surveyorSelect').value;$('workTypeWelcome').textContent='Welcome, '+currentSurveyor;show('workType')});$('openDepComBtn').addEventListener('click',()=>{$('depComWelcome').textContent='Welcome, '+currentSurveyor;show('depComApp');setTimeout(()=>$('searchBox').focus(),100)});$('openArrivalsBtn').addEventListener('click',()=>{$('arrivalsWelcome').textContent='Welcome, '+currentSurveyor;show('arrivalsApp');setTimeout(()=>$('arrivalSearchBox').focus(),100)});$('managerLoginBtn').addEventListener('click',()=>{if($('pinInput').value===MANAGER_PIN)show('managerApp');else alert('Incorrect PIN')});$('airlineSelect').addEventListener('change',renderCards);$('searchBox').addEventListener('input',renderCards);$('regionAll').addEventListener('click',()=>setRegion('depcom','All'));$('regionDomestic').addEventListener('click',()=>setRegion('depcom','Domestic'));$('regionInternational').addEventListener('click',()=>setRegion('depcom','International'));$('windowSelect').addEventListener('change',renderArrivalCards);$('arrivalSearchBox').addEventListener('input',renderArrivalCards);$('arrivalRegionAll').addEventListener('click',()=>setRegion('arrival','All'));$('arrivalRegionDomestic').addEventListener('click',()=>setRegion('arrival','Domestic'));$('arrivalRegionInternational').addEventListener('click',()=>setRegion('arrival','International'));$('sortMost').addEventListener('click',()=>{currentSort='most';$('sortMost').classList.add('active');$('sortAZ').classList.remove('active');renderCards()});$('sortAZ').addEventListener('click',()=>{currentSort='az';$('sortAZ').classList.add('active');$('sortMost').classList.remove('active');renderCards()});$('arrivalSortMost').addEventListener('click',()=>{arrivalSort='most';$('arrivalSortMost').classList.add('active');$('arrivalSortAZ').classList.remove('active');renderArrivalCards()});$('arrivalSortAZ').addEventListener('click',()=>{arrivalSort='az';$('arrivalSortAZ').classList.add('active');$('arrivalSortMost').classList.remove('active');renderArrivalCards()});$('undoBtn').addEventListener('click',undoLast);$('exportBtn').addEventListener('click',exportCsv);$('resetDayBtn').addEventListener('click',()=>{if(confirm('Reset today\'s progress counters? Workbook counts will not be restored.'))resetSurveyDay()});$('addAgentBtn').addEventListener('click',()=>{const n=$('newAgentName').value.trim();if(!n)return alert('Enter a surveyor name.');if(agents.some(a=>a.toLowerCase()===n.toLowerCase()))return alert('That surveyor already exists.');agents.push(n);$('newAgentName').value='';saveAll();fillSelects();renderAgents();renderManager()});$('newAgentName').addEventListener('keydown',e=>{if(e.key==='Enter')$('addAgentBtn').click()});$('resetActivityBtn').addEventListener('click',()=>{if(confirm('Reset demo activity and restore workbook counts?')){activity=[];depCom=cloneData(INITIAL_DEP_COM);arrivals=cloneData(INITIAL_ARRIVALS);saveAll();renderManager()}})}
-async function startApp(){
-  const cloudState = await loadCloudState();
+function wire(){
+  ensureCurrentDay();
+  fillSelects();
 
-  if(cloudState){
-    depCom = cloudState.depCom || depCom;
-    arrivals = cloudState.arrivals || arrivals;
-    agents = cloudState.agents || agents;
-    activity = cloudState.activity || activity;
-    currentDayKey = cloudState.currentDayKey || currentDayKey;
-
-    localStorage.setItem('soa_depcom_'+STORAGE_SUFFIX, JSON.stringify(depCom));
-    localStorage.setItem('soa_arrivals_'+STORAGE_SUFFIX, JSON.stringify(arrivals));
-    localStorage.setItem('soa_agents_'+STORAGE_SUFFIX, JSON.stringify(agents));
-    localStorage.setItem('soa_activity_'+STORAGE_SUFFIX, JSON.stringify(activity));
-    localStorage.setItem('soa_current_day_'+STORAGE_SUFFIX, currentDayKey);
+  if($('assignmentDate')){
+    $('assignmentDate').value=todayKey();
+    $('assignmentDate').addEventListener(
+      'change',
+      ()=>renderAssignments()
+    );
   }
 
-  wire();
+  $('workbookInput').addEventListener('change',()=>{
+    reviewedWorkbook=null;
+
+    $('workbookImportStatus').textContent=
+      $('workbookInput').files[0]
+        ? $('workbookInput').files[0].name+
+          ' selected. Click Review Workbook.'
+        : 'No workbook selected.';
+
+    $('workbookImportSummary').innerHTML='';
+  });
+
+  $('reviewWorkbookBtn').addEventListener(
+    'click',
+    handleWorkbookReview
+  );
+
+  $('agentModeBtn').addEventListener(
+    'click',
+    ()=>show('agentLogin')
+  );
+
+  $('managerModeBtn').addEventListener(
+    'click',
+    ()=>show('managerLogin')
+  );
+
+  document.querySelectorAll('[data-go]').forEach(button=>{
+    button.addEventListener(
+      'click',
+      ()=>show(button.dataset.go)
+    );
+  });
+
+  $('startAgentBtn').addEventListener('click',async()=>{
+    currentSurveyor=$('surveyorSelect').value;
+    $('workTypeWelcome').textContent=
+      'Welcome, '+currentSurveyor;
+
+    try{
+      await loadAgentAssignment();
+    }catch(error){
+      console.error('Agent assignment load failed:',error);
+      agentAssignment=null;
+    }
+
+    try{
+      managerMessages=await loadManagerMessages();
+    }catch(error){
+      console.error('Agent message load failed:',error);
+      managerMessages=[];
+    }
+
+    show('workType');
+  });
+
+  $('openDepComBtn').addEventListener('click',()=>{
+    $('depComWelcome').textContent=
+      'Welcome, '+currentSurveyor;
+
+    show('depComApp');
+
+    setTimeout(
+      ()=>$('searchBox').focus(),
+      100
+    );
+  });
+
+  $('openArrivalsBtn').addEventListener('click',()=>{
+    $('arrivalsWelcome').textContent=
+      'Welcome, '+currentSurveyor;
+
+    show('arrivalsApp');
+
+    setTimeout(
+      ()=>$('arrivalSearchBox').focus(),
+      100
+    );
+  });
+
+  $('managerLoginBtn').addEventListener('click',()=>{
+    if($('pinInput').value===MANAGER_PIN){
+      show('managerApp');
+    }else{
+      alert('Incorrect PIN');
+    }
+  });
+
+  $('airlineSelect').addEventListener(
+    'change',
+    renderCards
+  );
+
+  $('searchBox').addEventListener(
+    'input',
+    renderCards
+  );
+
+  $('regionAll').addEventListener(
+    'click',
+    ()=>setRegion('depcom','All')
+  );
+
+  $('regionDomestic').addEventListener(
+    'click',
+    ()=>setRegion('depcom','Domestic')
+  );
+
+  $('regionInternational').addEventListener(
+    'click',
+    ()=>setRegion('depcom','International')
+  );
+
+  $('windowSelect').addEventListener(
+    'change',
+    renderArrivalCards
+  );
+
+  $('arrivalSearchBox').addEventListener(
+    'input',
+    renderArrivalCards
+  );
+
+  $('arrivalRegionAll').addEventListener(
+    'click',
+    ()=>setRegion('arrival','All')
+  );
+
+  $('arrivalRegionDomestic').addEventListener(
+    'click',
+    ()=>setRegion('arrival','Domestic')
+  );
+
+  $('arrivalRegionInternational').addEventListener(
+    'click',
+    ()=>setRegion('arrival','International')
+  );
+
+  $('sortMost').addEventListener('click',()=>{
+    currentSort='most';
+    $('sortMost').classList.add('active');
+    $('sortAZ').classList.remove('active');
+    renderCards();
+  });
+
+  $('sortAZ').addEventListener('click',()=>{
+    currentSort='az';
+    $('sortAZ').classList.add('active');
+    $('sortMost').classList.remove('active');
+    renderCards();
+  });
+
+  $('arrivalSortMost').addEventListener('click',()=>{
+    arrivalSort='most';
+    $('arrivalSortMost').classList.add('active');
+    $('arrivalSortAZ').classList.remove('active');
+    renderArrivalCards();
+  });
+
+  $('arrivalSortAZ').addEventListener('click',()=>{
+    arrivalSort='az';
+    $('arrivalSortAZ').classList.add('active');
+    $('arrivalSortMost').classList.remove('active');
+    renderArrivalCards();
+  });
+
+  $('undoBtn').addEventListener(
+    'click',
+    undoLast
+  );
+
+  $('exportBtn').addEventListener(
+    'click',
+    exportCsv
+  );
+
+  $('resetDayBtn').addEventListener(
+    'click',
+    resetSurveyDay
+  );
+
+  $('addAgentBtn').addEventListener('click',async()=>{
+    const name=$('newAgentName').value.trim();
+
+    if(!name){
+      alert('Enter a surveyor name.');
+      return;
+    }
+
+    const duplicate=employees.some(
+      employee=>
+        employee.name.toLowerCase()===
+        name.toLowerCase()
+    );
+
+    if(duplicate){
+      alert('That surveyor already exists.');
+      return;
+    }
+
+    try{
+      await saveEmployee({
+        name,
+        shift_id:null,
+        team_role:'Surveyor',
+        active:true
+      });
+
+      $('newAgentName').value='';
+
+      await refreshEmployees();
+      renderManager();
+    }catch(error){
+      console.error(
+        'Surveyor creation failed:',
+        error
+      );
+
+      alert(
+        'The surveyor could not be added. '+
+        (error.message || '')
+      );
+    }
+  });
+
+  $('newAgentName').addEventListener(
+    'keydown',
+    event=>{
+      if(event.key==='Enter'){
+        $('addAgentBtn').click();
+      }
+    }
+  );
+
+  $('resetActivityBtn').addEventListener('click',()=>{
+    alert(
+      'Survey work-log history is protected and cannot be deleted. '+
+      'Publish an ASQ workbook to update official requirements.'
+    );
+  });
 }
 
+async function startApp(){
+  try{
+    const cloudState=await loadCloudState();
+
+    if(cloudState){
+      depCom=cloudState.depCom || depCom;
+      arrivals=cloudState.arrivals || arrivals;
+      agents=cloudState.agents || agents;
+      activity=cloudState.activity || activity;
+      currentDayKey=
+        cloudState.currentDayKey || currentDayKey;
+
+      localStorage.setItem(
+        'soa_depcom_'+STORAGE_SUFFIX,
+        JSON.stringify(depCom)
+      );
+
+      localStorage.setItem(
+        'soa_arrivals_'+STORAGE_SUFFIX,
+        JSON.stringify(arrivals)
+      );
+
+      localStorage.setItem(
+        'soa_agents_'+STORAGE_SUFFIX,
+        JSON.stringify(agents)
+      );
+
+      localStorage.setItem(
+        'soa_activity_'+STORAGE_SUFFIX,
+        JSON.stringify(activity)
+      );
+
+      localStorage.setItem(
+        'soa_current_day_'+STORAGE_SUFFIX,
+        currentDayKey
+      );
+    }
+  }catch(error){
+    console.error('Cloud state startup failed:',error);
+  }
+
+  // Wire the existing app first so its buttons always work.
+  wire();
+
+  // Then attempt the employee migration separately.
+  try{
+    await migrateLegacyAgents();
+    fillSelects();
+  }catch(error){
+    console.error('Employee startup failed:',error);
+  }
+}
 if(document.readyState==='loading'){
   document.addEventListener('DOMContentLoaded',startApp);
 }else{

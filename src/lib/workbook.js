@@ -66,16 +66,25 @@ function parseMetricBlocks(rows) {
   }
 
   const blocks = new Map();
+  let currentCode = '';
 
   for (let rowIndex = 3; rowIndex < rows.length; rowIndex += 1) {
     const row = rows[rowIndex] || [];
-    const code = normalizeText(row[0]).toUpperCase();
+    const rowCode = normalizeText(row[0]).toUpperCase();
     const metric = normalizeText(row[1]);
     const traffic = normalizeText(row[2]);
 
-    if (!/^[A-Z0-9]{3}$/.test(code) || !METRIC_NAMES.has(metric)) {
+    if (/^[A-Z0-9]{3}$/.test(rowCode)) {
+      currentCode = rowCode;
+    } else if (rowCode) {
+      currentCode = '';
+    }
+
+    if (!currentCode || !METRIC_NAMES.has(metric)) {
       continue;
     }
+
+    const code = currentCode;
 
     if (!blocks.has(code)) {
       blocks.set(code, {
@@ -141,6 +150,9 @@ function parseAirlineSheet(rows, type, referenceMaps) {
         code: block.code,
         ...details,
         [`${type}Remaining`]: metricFor(block, 'Remaining', airline),
+        [`${type}TargetOriginal`]: metricFor(block, 'Target Original', airline),
+        [`${type}TargetModified`]: metricFor(block, 'Target Modified', airline),
+        [`${type}CompletedTargets`]: metricFor(block, 'Completed Targets', airline),
         [`${type}AboveGoal`]: metricFor(block, 'Over Quota', airline)
       });
     }
@@ -156,6 +168,9 @@ function mergeDepartureCommercial(departures, commercial) {
     merged.set(row.id, {
       ...row,
       commercialRemaining: 0,
+      commercialTargetOriginal: 0,
+      commercialTargetModified: 0,
+      commercialCompletedTargets: 0,
       commercialAboveGoal: 0
     });
   }
@@ -164,11 +179,17 @@ function mergeDepartureCommercial(departures, commercial) {
     const current = merged.get(row.id);
     if (current) {
       current.commercialRemaining = row.commercialRemaining || 0;
+      current.commercialTargetOriginal = row.commercialTargetOriginal || 0;
+      current.commercialTargetModified = row.commercialTargetModified || 0;
+      current.commercialCompletedTargets = row.commercialCompletedTargets || 0;
       current.commercialAboveGoal = row.commercialAboveGoal || 0;
     } else {
       merged.set(row.id, {
         ...row,
         departureRemaining: 0,
+        departureTargetOriginal: 0,
+        departureTargetModified: 0,
+        departureCompletedTargets: 0,
         departureAboveGoal: 0
       });
     }
@@ -195,6 +216,9 @@ function parseArrivals(rows, referenceMaps) {
         code: block.code,
         ...details,
         arrivalRemaining: metricFor(block, 'Remaining', window),
+        arrivalTargetOriginal: metricFor(block, 'Target Original', window),
+        arrivalTargetModified: metricFor(block, 'Target Modified', window),
+        arrivalCompletedTargets: metricFor(block, 'Completed Targets', window),
         arrivalAboveGoal: metricFor(block, 'Over Quota', window),
         search: `${details.search} ${window}`.toLowerCase()
       });
@@ -231,6 +255,15 @@ function countSummary(depCom, arrivals) {
     departureRemainingTotal: depCom.reduce((sum, row) => sum + (row.departureRemaining || 0), 0),
     commercialRemainingTotal: depCom.reduce((sum, row) => sum + (row.commercialRemaining || 0), 0),
     arrivalRemainingTotal: arrivals.reduce((sum, row) => sum + (row.arrivalRemaining || 0), 0),
+    departureTargetOriginalTotal: depCom.reduce((sum, row) => sum + (row.departureTargetOriginal || 0), 0),
+    commercialTargetOriginalTotal: depCom.reduce((sum, row) => sum + (row.commercialTargetOriginal || 0), 0),
+    arrivalTargetOriginalTotal: arrivals.reduce((sum, row) => sum + (row.arrivalTargetOriginal || 0), 0),
+    departureTargetModifiedTotal: depCom.reduce((sum, row) => sum + (row.departureTargetModified || 0), 0),
+    commercialTargetModifiedTotal: depCom.reduce((sum, row) => sum + (row.commercialTargetModified || 0), 0),
+    arrivalTargetModifiedTotal: arrivals.reduce((sum, row) => sum + (row.arrivalTargetModified || 0), 0),
+    departureCompletedTargetsTotal: depCom.reduce((sum, row) => sum + (row.departureCompletedTargets || 0), 0),
+    commercialCompletedTargetsTotal: depCom.reduce((sum, row) => sum + (row.commercialCompletedTargets || 0), 0),
+    arrivalCompletedTargetsTotal: arrivals.reduce((sum, row) => sum + (row.arrivalCompletedTargets || 0), 0),
     departureAboveGoalTotal: departures.reduce((sum, row) => sum + (row.departureAboveGoal || 0), 0),
     commercialAboveGoalTotal: commercial.reduce((sum, row) => sum + (row.commercialAboveGoal || 0), 0),
     arrivalAboveGoalTotal: arrivals.reduce((sum, row) => sum + (row.arrivalAboveGoal || 0), 0)
