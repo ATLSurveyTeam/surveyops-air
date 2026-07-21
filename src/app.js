@@ -39,6 +39,14 @@ let assignmentsForSummaryWeek=[];
 let schedulesByEmployee=new Map();
 let agentAssignment=null;
 let managerMessages=[];
+let workbookMeta=JSON.parse(
+  localStorage.getItem('soa_workbook_meta_'+STORAGE_SUFFIX) || 'null'
+) || {
+  sourceFile:META.sourceFile,
+  depComCards:META.depComCards,
+  arrivalRecords:META.arrivalRecords,
+  publishedAt:null
+};
 
 let activity=JSON.parse(localStorage.getItem('soa_activity_'+STORAGE_SUFFIX)||'null')||[];
 let currentSurveyor='',
@@ -50,16 +58,49 @@ let currentSurveyor='',
   noticeTimer=null,
   pinnedDepComId=null,
   pinnedDepComIndex=null,
+  surveySubmissionLockedUntil=0,
   reviewedWorkbook=null;
 function todayKey(){return new Date().toISOString().slice(0,10)}
+function currentArrivalWindow(date=new Date()){
+  const hour=date.getHours();
+
+  if(hour<6)return null;
+  if(hour<9)return ARRIVAL_WINDOWS[0];
+  if(hour<12)return ARRIVAL_WINDOWS[1];
+  if(hour<15)return ARRIVAL_WINDOWS[2];
+  if(hour<18)return ARRIVAL_WINDOWS[3];
+  if(hour<21)return ARRIVAL_WINDOWS[4];
+  return ARRIVAL_WINDOWS[5];
+}
 let currentDayKey=localStorage.getItem('soa_current_day_'+STORAGE_SUFFIX)||todayKey();
 function ensureCurrentDay(){const t=todayKey(); if(currentDayKey!==t){currentDayKey=t; localStorage.setItem('soa_current_day_'+STORAGE_SUFFIX,currentDayKey);}}
 function countableActivity(){
   return activity.filter(item=>
-    item.action!=='Undo' &&
-    item.action!=='System' &&
+    (item.action || 'Recorded')==='Recorded' &&
     item.voided!==true
   );
+}
+
+function ensureActivityAuditIds(){
+  let changed=false;
+  const assignedAt=new Date().toISOString();
+
+  activity.forEach((item,index)=>{
+    if(item.auditId)return;
+
+    item.auditId=
+      (globalThis.crypto?.randomUUID?.()) ||
+      (
+        'legacy-audit-'+
+        Date.now()+'-'+
+        index+'-'+
+        Math.random().toString(16).slice(2)
+      );
+    item.auditIdAssignedAt=assignedAt;
+    changed=true;
+  });
+
+  if(changed)saveAll();
 }
 function todayActivity(){
   ensureCurrentDay();
@@ -67,13 +108,24 @@ function todayActivity(){
 }
 function $(id){return document.getElementById(id)}
 function saveAll(){
-  const state = { depCom, arrivals, agents, activity, currentDayKey };
+  const state = {
+    depCom,
+    arrivals,
+    agents,
+    activity,
+    currentDayKey,
+    workbookMeta
+  };
 
   localStorage.setItem('soa_depcom_'+STORAGE_SUFFIX, JSON.stringify(depCom));
   localStorage.setItem('soa_arrivals_'+STORAGE_SUFFIX, JSON.stringify(arrivals));
   localStorage.setItem('soa_agents_'+STORAGE_SUFFIX, JSON.stringify(agents));
   localStorage.setItem('soa_activity_'+STORAGE_SUFFIX, JSON.stringify(activity));
   localStorage.setItem('soa_current_day_'+STORAGE_SUFFIX, currentDayKey);
+  localStorage.setItem(
+    'soa_workbook_meta_'+STORAGE_SUFFIX,
+    JSON.stringify(workbookMeta)
+  );
 
   saveCloudState(state);
 }
@@ -260,7 +312,7 @@ function filteredRequirements(){
   return arr;
 }
 function surveyBlock(r,type){const cap=type.charAt(0).toUpperCase()+type.slice(1);const rem=r[type+'Remaining']||0;const above=r[type+'AboveGoal']||0;const isComm=type==='commercial';const icon=isComm?'🛍':'✈️';const label=rem>0?'+1 '+cap:'+1 Above Goal';const cls=rem>0?(isComm?'commercial':''):'gold';let countHtml=rem>0?'<div class="count">'+icon+' '+cap+' Still Needed: <span>'+rem+'</span></div>':'<div class="count above">'+icon+' '+cap+' Minimum Achieved ✓</div><div class="muted">'+cap+' Above Goal: '+above+'</div>';return '<div class="survey-row">'+countHtml+'<button class="action-btn '+cls+'" data-id="'+r.id+'|'+type+'">'+label+'</button></div>'}
-function renderCards(){renderUserProgress();const arr=filteredRequirements();$('cards').innerHTML=arr.length?arr.map(r=>{let pills='<span class="pill '+(r.traffic==='International'?'intl':'')+'">'+escapeHtml(r.traffic||'')+'</span>';let blocks='';blocks+=surveyBlock(r,'departure');blocks+=surveyBlock(r,'commercial');if(!blocks)blocks='<div class="muted">No open requirements for this airport.</div>';return '<div class="card '+priorityClass(totalStillNeeded(r))+'"><div class="airport"><span class="airport-code">'+escapeHtml(r.code||'')+'</span>'+escapeHtml(r.city)+'</div><div class="airport-name">'+escapeHtml(r.airport||r.code)+'</div>'+pills+blocks+'</div>'}).join(''):'<div class="panel"><strong>No matching airports.</strong><div class="muted">Try another search or airline.</div></div>';document.querySelectorAll('#cards .action-btn').forEach(btn=>btn.addEventListener('click',()=>addSurvey(btn.dataset.id)))}
+function renderCards(){renderUserProgress();const arr=filteredRequirements();$('cards').innerHTML=arr.length?arr.map(r=>{let pills='<span class="pill '+(r.traffic==='International'?'intl':'')+'">'+escapeHtml(r.traffic||'')+'</span>';let blocks='';blocks+=surveyBlock(r,'departure');blocks+=surveyBlock(r,'commercial');if(!blocks)blocks='<div class="muted">No open requirements for this airport.</div>';return '<div class="card '+priorityClass(totalStillNeeded(r))+'"><div class="airport"><span class="airport-code">'+escapeHtml(r.code||'')+'</span>'+escapeHtml(r.city)+'</div><div class="airport-name">'+escapeHtml(r.airport||r.code)+'</div>'+pills+blocks+'</div>'}).join(''):'<div class="panel"><strong>No matching airports.</strong><div class="muted">Try another search or airline.</div></div>';document.querySelectorAll('#cards .action-btn').forEach(btn=>btn.addEventListener('click',()=>addSurvey(btn.dataset.id,btn)))}
 function filteredArrivals(){const win=$('windowSelect').value;const q=$('arrivalSearchBox').value.trim().toLowerCase();let arr=arrivals.filter(r=>r.window===win);if(arrivalRegion!=='All')arr=arr.filter(r=>r.traffic===arrivalRegion);if(q)arr=arr.filter(r=>(r.search||'').includes(q));if(arrivalSort==='az')arr.sort((a,b)=>(a.city||a.code).localeCompare(b.city||b.code));else arr.sort((a,b)=>((b.arrivalRemaining||0)-(a.arrivalRemaining||0))||((a.city||a.code).localeCompare(b.city||b.code)));return arr;}
 function arrivalBlock(r){
   const rem=Number(r.arrivalRemaining||0);
@@ -270,8 +322,8 @@ function arrivalBlock(r){
   }
   return '<div class="survey-row"><div><div class="count above">🛬 Arrival Minimum Achieved ✓</div><div class="muted">Arrival Over Goal: '+above+'</div></div><button class="action-btn gold" data-id="'+r.id+'|arrival">+1 Arrival Over Goal</button></div>';
 }
-function renderArrivalCards(){renderUserProgress();const arr=filteredArrivals();$('arrivalCards').innerHTML=arr.length?arr.map(r=>{let pill='<span class="pill '+(r.traffic==='International'?'intl':'')+'">'+escapeHtml(r.traffic||'')+'</span><span class="pill">'+escapeHtml(r.window)+'</span>';return '<div class="card '+priorityClass(r.arrivalRemaining||0)+'"><div class="airport"><span class="airport-code">'+escapeHtml(r.code||'')+'</span>'+escapeHtml(r.city)+'</div><div class="airport-name">'+escapeHtml(r.airport||r.code)+'</div>'+pill+arrivalBlock(r)+'</div>'}).join(''):'<div class="panel"><strong>No matching arrivals.</strong><div class="muted">Try another search or arrival window.</div></div>';document.querySelectorAll('#arrivalCards .action-btn').forEach(btn=>btn.addEventListener('click',()=>addSurvey(btn.dataset.id)))}
-function addSurvey(id){
+function renderArrivalCards(){renderUserProgress();const arr=filteredArrivals();$('arrivalCards').innerHTML=arr.length?arr.map(r=>{let pill='<span class="pill '+(r.traffic==='International'?'intl':'')+'">'+escapeHtml(r.traffic||'')+'</span><span class="pill">'+escapeHtml(r.window)+'</span>';return '<div class="card '+priorityClass(r.arrivalRemaining||0)+'"><div class="airport"><span class="airport-code">'+escapeHtml(r.code||'')+'</span>'+escapeHtml(r.city)+'</div><div class="airport-name">'+escapeHtml(r.airport||r.code)+'</div>'+pill+arrivalBlock(r)+'</div>'}).join(''):'<div class="panel"><strong>No matching arrivals.</strong><div class="muted">Try another search or arrival window.</div></div>';document.querySelectorAll('#arrivalCards .action-btn').forEach(btn=>btn.addEventListener('click',()=>addSurvey(btn.dataset.id,btn)))}
+function addSurvey(id,button){
   const parts=id.split('|');
   const type=parts.pop();
   const baseId=parts.join('|');
@@ -295,6 +347,40 @@ function addSurvey(id){
   }
 
   if(!r)return;
+
+  const nowMs=Date.now();
+
+  if(nowMs<surveySubmissionLockedUntil){
+    if(button){
+      const originalText=button.textContent;
+      button.disabled=true;
+      button.textContent='Please wait...';
+      setTimeout(()=>{
+        if(button.isConnected){
+          button.disabled=false;
+          button.textContent=originalText;
+        }
+      },Math.max(250,surveySubmissionLockedUntil-nowMs));
+    }
+    return;
+  }
+
+  if(type==='arrival'){
+    const expectedWindow=currentArrivalWindow();
+
+    if(expectedWindow && r.window!==expectedWindow){
+      const confirmed=confirm(
+        'Arrival window check\n\n'+
+        'Selected: '+r.window+'\n'+
+        'Current time window: '+expectedWindow+'\n\n'+
+        'Record this survey in the selected window anyway?'
+      );
+
+      if(!confirmed)return;
+    }
+  }
+
+  surveySubmissionLockedUntil=nowMs+1500;
 
   if(type!=='arrival' && currentSort==='most'){
     const visibleBeforeUpdate=filteredRequirements();
@@ -525,15 +611,34 @@ function employeeShiftName(employee){
 }
 
 function renderActivity(){
+  ensureActivityAuditIds();
   const rows=activity.slice().reverse().slice(0,75);
   $('activityTable').innerHTML=rows.length
-    ? '<table><thead><tr>'+
-        '<th>Survey Day</th><th>Time</th><th>Surveyor</th>'+
+    ? '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">'+
+        '<button class="small-btn" type="button" data-activity-void-selected disabled>'+
+          'Void Selected Records'+
+        '</button>'+
+        '<span class="muted" data-activity-selected-count>0 selected</span>'+
+        '<span class="muted">Only active recorded surveys can be selected.</span>'+
+      '</div>'+
+      '<table><thead><tr>'+
+        '<th>Select</th><th>Survey Day</th><th>Time</th><th>Surveyor</th>'+
         '<th>Action</th><th>Status</th><th>Type</th>'+
         '<th>Airline/Window</th><th>Airport</th>'+
       '</tr></thead><tbody>'+
-      rows.map(a=>
-        '<tr>'+
+      rows.map(a=>{
+        const canVoid=
+          (a.action || 'Recorded')==='Recorded' &&
+          a.voided!==true &&
+          Boolean(a.auditId);
+
+        return (
+          '<tr>'+
+          '<td style="text-align:center">'+
+            (canVoid
+              ? '<input type="checkbox" data-activity-void-id="'+escapeHtml(a.auditId)+'" aria-label="Select activity record">'
+              : '<span class="muted">—</span>')+
+          '</td>'+
           '<td>'+escapeHtml(a.dayKey||'Legacy')+'</td>'+
           '<td>'+escapeHtml(a.time)+'</td>'+
           '<td>'+escapeHtml(a.surveyor)+'</td>'+
@@ -542,10 +647,107 @@ function renderActivity(){
           '<td>'+escapeHtml(a.aboveGoal?a.type+' Above Goal':a.type)+'</td>'+
           '<td>'+escapeHtml(a.context)+'</td>'+
           '<td>'+escapeHtml(a.city)+'</td>'+
-        '</tr>'
-      ).join('')+
+          '</tr>'
+        );
+      }).join('')+
       '</tbody></table>'
     : '<div class="muted">No activity yet.</div>';
+
+  const voidButton=document.querySelector('[data-activity-void-selected]');
+  const countLabel=document.querySelector('[data-activity-selected-count]');
+  const checkboxes=Array.from(
+    document.querySelectorAll('[data-activity-void-id]')
+  );
+
+  const updateSelection=()=>{
+    const count=checkboxes.filter(checkbox=>checkbox.checked).length;
+    if(voidButton)voidButton.disabled=count===0;
+    if(countLabel)countLabel.textContent=count+' selected';
+  };
+
+  checkboxes.forEach(checkbox=>
+    checkbox.addEventListener('change',updateSelection)
+  );
+  voidButton?.addEventListener('click',voidSelectedActivityRecords);
+}
+
+function voidSelectedActivityRecords(){
+  const selectedIds=Array.from(
+    document.querySelectorAll('[data-activity-void-id]:checked')
+  ).map(checkbox=>checkbox.dataset.activityVoidId);
+
+  if(!selectedIds.length)return;
+
+  const reason=prompt(
+    'Reason for voiding '+selectedIds.length+' selected record'+
+    (selectedIds.length===1 ? '' : 's')+':',
+    'Invalid rapid-entry activity'
+  );
+
+  if(reason===null)return;
+  if(!reason.trim()){
+    alert('Enter a reason for the audit record.');
+    return;
+  }
+
+  const confirmed=confirm(
+    'Void '+selectedIds.length+' selected activity record'+
+    (selectedIds.length===1 ? '' : 's')+'?\n\n'+
+    'They will be removed from progress totals but retained as Voided. '+
+    'Matching audit events will be added. This will not change ASQ workbook counts.'
+  );
+
+  if(!confirmed)return;
+
+  const now=new Date();
+  let voidedCount=0;
+
+  selectedIds.forEach(auditId=>{
+    const original=activity.find(item=>
+      item.auditId===auditId &&
+      (item.action || 'Recorded')==='Recorded' &&
+      item.voided!==true
+    );
+
+    if(!original)return;
+
+    original.voided=true;
+    original.status='Voided';
+    original.voidedAt=now.toISOString();
+    original.voidReason=reason.trim();
+
+    activity.push({
+      auditId:
+        (globalThis.crypto?.randomUUID?.()) ||
+        ('audit-'+Date.now()+'-'+Math.random().toString(16).slice(2)),
+      dayKey:original.dayKey,
+      time:now.toLocaleString(),
+      surveyor:original.surveyor,
+      type:original.type,
+      context:original.context,
+      code:original.code,
+      city:original.city,
+      airport:original.airport,
+      traffic:original.traffic,
+      aboveGoal:original.aboveGoal,
+      action:'Admin Void',
+      status:'Audit Event',
+      voidsAuditId:original.auditId,
+      voidReason:reason.trim(),
+      voided:false
+    });
+
+    voidedCount+=1;
+  });
+
+  if(!voidedCount)return;
+
+  saveAll();
+  renderManager();
+  alert(
+    voidedCount+' record'+(voidedCount===1 ? ' was' : 's were')+
+    ' voided. Original entries and audit events remain in the Activity Log.'
+  );
 }
 
 function resetSurveyDay(){
@@ -565,9 +767,14 @@ function renderManager(){
   const arrRemaining=arrivals.reduce((sum,row)=>sum+(row.arrivalRemaining||0),0);
 
   $('sourceMeta').textContent=
-    'Survey Day: '+currentDayKey+' • '+META.sourceFile+' • '+
-    META.depComCards+' departure/commercial cards • '+
-    META.arrivalRecords+' arrival records';
+    'Survey Day: '+currentDayKey+' • '+workbookMeta.sourceFile+' • '+
+    workbookMeta.depComCards+' departure/commercial cards • '+
+    workbookMeta.arrivalRecords+' arrival records'+
+    (
+      workbookMeta.publishedAt
+        ? ' • Published '+new Date(workbookMeta.publishedAt).toLocaleString()
+        : ''
+    );
 
   $('summaryStats').innerHTML=
     '<div class="stat"><div class="muted">Recorded</div><div class="num">'+completed+'</div></div>'+ 
@@ -2118,7 +2325,7 @@ function exportCsv(){
   const header=[
     'AuditID','SurveyDay','Time','Surveyor','Action','Status',
     'VoidsAuditID','SurveyType','Context','Code','City','Airport',
-    'Traffic','AboveGoal'
+    'Traffic','AboveGoal','VoidReason'
   ];
   const rows=activity.map(a=>[
     a.auditId||'',
@@ -2134,7 +2341,8 @@ function exportCsv(){
     a.city,
     a.airport,
     a.traffic,
-    a.aboveGoal?'Yes':'No'
+    a.aboveGoal?'Yes':'No',
+    a.voidReason||''
   ]);
   const csv=[header].concat(rows)
     .map(row=>row.map(value=>
@@ -2213,10 +2421,17 @@ async function handleWorkbookPublish(){
 
   const previousDepCom=cloneData(depCom);
   const previousArrivals=cloneData(arrivals);
+  const previousWorkbookMeta=cloneData(workbookMeta);
 
   try{
     depCom=cloneData(reviewedWorkbook.depCom);
     arrivals=cloneData(reviewedWorkbook.arrivals);
+    workbookMeta={
+      sourceFile:reviewedWorkbook.fileName,
+      depComCards:depCom.length,
+      arrivalRecords:arrivals.length,
+      publishedAt:new Date().toISOString()
+    };
 
     await saveAll();
 
@@ -2235,6 +2450,7 @@ async function handleWorkbookPublish(){
   }catch(error){
     depCom=previousDepCom;
     arrivals=previousArrivals;
+    workbookMeta=previousWorkbookMeta;
 
     await saveAll();
 
@@ -2358,6 +2574,18 @@ function wire(){
   $('openArrivalsBtn').addEventListener('click',()=>{
     $('arrivalsWelcome').textContent=
       'Welcome, '+currentSurveyor;
+
+    const expectedWindow=currentArrivalWindow();
+    const windowSelect=$('windowSelect');
+
+    if(
+      expectedWindow &&
+      Array.from(windowSelect.options).some(
+        option=>option.value===expectedWindow
+      )
+    ){
+      windowSelect.value=expectedWindow;
+    }
 
     show('arrivalsApp');
 
@@ -2540,6 +2768,8 @@ async function startApp(){
       activity=cloudState.activity || activity;
       currentDayKey=
         cloudState.currentDayKey || currentDayKey;
+      workbookMeta=
+        cloudState.workbookMeta || workbookMeta;
 
       localStorage.setItem(
         'soa_depcom_'+STORAGE_SUFFIX,
@@ -2564,6 +2794,11 @@ async function startApp(){
       localStorage.setItem(
         'soa_current_day_'+STORAGE_SUFFIX,
         currentDayKey
+      );
+
+      localStorage.setItem(
+        'soa_workbook_meta_'+STORAGE_SUFFIX,
+        JSON.stringify(workbookMeta)
       );
     }
   }catch(error){
